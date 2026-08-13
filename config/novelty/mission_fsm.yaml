@@ -1,0 +1,32 @@
+# -----------------------------------------------------------------------------
+# §2.3 mission state machine - per-state timeouts. Every non-terminal state
+# (drone_stack/novelty/mission_fsm.py TIMED_STATES) MUST have an entry here;
+# novelty/config.py fails loud if one is missing or if an entry names a
+# state that does not exist. See docs/novelty/mission_fsm.md for the full
+# transition table these timeouts bound.
+# -----------------------------------------------------------------------------
+
+state_timeout_s:
+  # GUESSED - all values below are starting points, not flight-tested.
+  SEARCHING_PERSON: 60.0
+  PERSON_FOUND: 5.0
+  SEARCHING_ZONE: 30.0
+  ZONE_FOUND: 10.0
+  DESCENDING: 45.0
+  ABORT_DESCENT: 5.0
+  AUTHENTICATING: 20.0
+  HOVER_AND_RETRY: 15.0
+  RELEASING: 8.0
+  ASCENDING: 20.0
+  EXPANDING_SEARCH_RADIUS: 10.0
+
+# How much to widen the search radius each time EXPANDING_SEARCH_RADIUS
+# fires (metres), and the ceiling before giving up entirely -> ABORT_RTL.
+# GUESSED.
+search_radius_expansion_m: 5.0
+max_search_radius_m: 30.0
+
+# Max times HOVER_AND_RETRY loops back to AUTHENTICATING before giving up.
+# The brief specifies exactly one retry for disambiguation (§2.5); kept
+# configurable rather than hardcoded per §7 ("no magic numbers").
+max_hover_retries: 1

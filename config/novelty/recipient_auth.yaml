@@ -1,0 +1,66 @@
+# -----------------------------------------------------------------------------
+# §2.2 dual-factor BLE + vision recipient authentication, and
+# §2.5 multi-person disambiguation.
+# See docs/novelty/recipient_auth.md and docs/novelty/disambiguation.md for
+# the full fusion logic and worked examples. Every value is a GUESSED
+# starting point unless noted.
+# -----------------------------------------------------------------------------
+
+# Both channels (BLE handshake success, vision person-in-frame) must land
+# within this window of each other to be treated as "concurrent". GUESSED.
+sync_window_ms: 2000
+
+# Max allowed distance (metres) between the vision-projected person ground
+# position and the BLE-derived device position, when the phone reported its
+# own GPS fix (accurate case). GUESSED - narrow because GPS-vs-vision should
+# agree closely at handoff range.
+max_position_disagreement_m: 4.0
+
+# Same threshold, but for when only RSSI path-loss ranging is available (no
+# phone GPS) - deliberately wider because RSSI ranging is +-5-10 m typical,
+# worse with body blocking (see docs/novelty/recipient_auth.md "Known
+# limitations"). Must be >= max_position_disagreement_m (config.py enforces
+# this). GUESSED.
+max_position_disagreement_m_rssi_only: 10.0
+
+# Branch 3 (BLE ok, vision fails): how long to keep retrying vision before
+# aborting. GUESSED.
+vision_retry_timeout_s: 15.0
+
+# Branch 4 (vision ok, BLE fails): how long to keep retrying BLE before
+# aborting - vision alone is never sufficient to release (brief §2.2 rule
+# 4). GUESSED.
+ble_retry_timeout_s: 15.0
+
+# Branch 5 (both succeed but disagree beyond threshold - adversarial/
+# ambiguous): retry window before giving up after ONE retry. GUESSED.
+disagreement_retry_timeout_s: 10.0
+
+# §2.5 disambiguation: the highest-scoring person must beat the second-best
+# by at least this margin (same 0..1 likelihood scale as the weights below)
+# to be selected without triggering HOVER_AND_RETRY. GUESSED.
+disambiguation_margin: 0.15
+
+# likelihood(person_i) = alpha*ble_position_agreement(person_i)
+#                       + beta*ble_rssi_consistency(person_i)
+#                       + gamma*gesture_or_motion_cue(person_i)
+# Weights should sum to 1.0 so likelihood stays on a 0..1 scale comparable
+# to disambiguation_margin above. gamma is 0 by default because no gesture
+# model exists yet (brief §2.5: "optional if model supports") - raise it
+# once one does, no code change needed.
+disambiguation_weights:
+  alpha_ble_position: 0.6
+  beta_rssi_consistency: 0.4
+  gamma_motion_cue: 0.0
+
+# Log-distance path-loss model for BLE-RSSI ranging (used only when the
+# phone does not report GPS):
+#   distance_m = 10 ** ((tx_power_dbm - rssi_dbm) / (10 * path_loss_exponent))
+# tx_power_dbm is the RSSI expected at 1 metre; path_loss_exponent is
+# environment-dependent (2.0 = free space, 2.7-3.5 = indoor/cluttered
+# outdoor). BOTH GUESSED - must be calibrated against the actual BLE
+# module/antenna before this ranging is trustworthy; see
+# docs/novelty/recipient_auth.md "Known limitations".
+rssi:
+  tx_power_dbm: -59.0
+  path_loss_exponent: 2.7

@@ -1,0 +1,32 @@
+# -----------------------------------------------------------------------------
+# §2.4 recipient-motion-aware landing abort.
+# See docs/novelty/motion_monitor.md for the full algorithm. Every value is
+# a GUESSED starting point.
+# -----------------------------------------------------------------------------
+
+# ABORT_DESCENT fires when the tracked recipient's displacement rate
+# exceeds this AND remaining altitude is below abort_altitude_ceiling_m
+# (brief §2.4: both conditions required, not either). GUESSED - a brisk
+# walk is roughly 1.4 m/s; set above normal shuffling/settling motion but
+# well below a jog.
+max_recipient_velocity_mps: 1.2
+
+# The velocity check above only applies once the drone is this low or
+# lower. Above this altitude a moving recipient does not abort the
+# approach (there is time to re-track before descent continues). GUESSED.
+abort_altitude_ceiling_m: 8.0
+
+# ABORT_DESCENT also fires if any NEW person (not the confirmed recipient)
+# enters within this radius of the landing zone centroid during descent.
+# GUESSED.
+zone_intrusion_radius_m: 3.0
+
+# Frames of centroid history kept per tracked person for velocity
+# smoothing (simple average displacement over the window, not a single
+# frame-to-frame delta, to reduce detector-jitter false aborts).
+track_history_len: 5
+
+# Minimum frames of history required before a velocity estimate is trusted
+# (fewer than this -> no abort decision from motion yet, avoids acting on
+# a single noisy detection).
+min_track_frames: 3

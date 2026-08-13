@@ -1,0 +1,70 @@
+# -----------------------------------------------------------------------------
+# §2.1 markerless landing-zone selection - scoring parameters.
+#
+#   score(cell) = w1*surface_suitability(class) + w2*(1 - normalized_slope)
+#               + w3*(1 - clutter_density) + w4*size_of_contiguous_safe_area
+#               - penalty_if_outside_radius(cell, person_centroid, r_min, r_max)
+#
+# See docs/novelty/landing_zone.md for the full formula and worked examples.
+# Every value below is a GUESSED starting point - see the note beside it if
+# it should be set from real flight data before this layer flies live.
+# -----------------------------------------------------------------------------
+
+weights:
+  # GUESSED - relative importance of the four terms. Sum need not be 1; the
+  # scorer does not normalise them (min_score below is tuned against these
+  # exact weights, not a normalised 0..1 scale).
+  w1_surface: 0.40
+  w2_slope: 0.25
+  w3_clutter: 0.20
+  w4_area: 0.15
+
+# 0..1 suitability per terrain class. Every TerrainClass value MUST be
+# present (novelty/config.py fails loud otherwise).
+surface_suitability:
+  grass: 0.95        # ideal - soft, predictable, no debris typical
+  dirt: 0.75          # acceptable, dustier and less even than grass
+  pavement: 0.55       # walkable but harder landing, may be a driveway/road
+  vegetation: 0.30     # tall grass/shrubs - obstruction risk, penalised
+  water: 0.0           # never suitable
+  obstacle: 0.0         # never suitable (building/vehicle/etc. in the cell)
+  unknown: 0.10         # low-confidence cell (e.g. binary-model fallback,
+                        # or camera edge) - scores low but not zero, so a
+                        # mission with no confidently-classified cells still
+                        # gets a (weak) candidate instead of an empty list.
+
+# Proximity-to-recipient band (metres). Cells closer than r_min_m or farther
+# than r_max_m from the detected person's projected ground position are
+# penalised - see penalty_if_outside_radius in docs/novelty/landing_zone.md.
+# GUESSED - set from real handoff-distance requirements.
+r_min_m: 2.0
+r_max_m: 12.0
+
+# Minimum acceptable score; below this, score_candidates() returns an empty
+# list (the FSM's SEARCHING_ZONE state treats that as "not found yet" and
+# eventually times out into EXPANDING_SEARCH_RADIUS). GUESSED.
+min_score: 0.35
+
+# Slope >= this normalises to 1.0 (fully unsuitable on the slope term).
+# GUESSED - typical small-multirotor landing-gear tolerance is ~10-15 deg;
+# this is set conservatively pending real slope-estimation data (there is
+# no depth sensor yet - see "Known limitations" in the doc).
+max_slope_deg: 12.0
+
+# A candidate's contiguous safe area must have at least this radius to be
+# returned at all (below this the parcel/drone footprint may not fit).
+# GUESSED - should be set from the airframe's actual footprint + margin.
+min_safe_radius_m: 1.5
+
+# Number of ranked candidates returned by score_candidates().
+top_k: 3
+
+# Ground sampling distance per grid cell (metres) - the resolution scoring
+# operates at. Smaller = finer-grained but more compute per frame.
+cell_size_m: 0.5
+
+# Clutter density normalisation: normalized_clutter = min(count / clutter_norm, 1).
+# GUESSED - "count" is per-cell obstruction count from the person-detection
+# model's non-person detections if available, else segmentation "obstacle"
+# class density (see docs/novelty/landing_zone.md "Clutter density").
+clutter_norm: 4.0

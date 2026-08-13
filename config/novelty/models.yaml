@@ -1,0 +1,61 @@
+# -----------------------------------------------------------------------------
+# §2.6 model interface abstraction. New weights = edit this file, no code
+# change (drone_stack/novelty/perception/model_registry.py enforces this -
+# if a new .hef ever needs a code change here, that is a bug in the
+# abstraction, not in this file). hef_path is repo-root-relative.
+#
+# Both entries below point at the CURRENT placeholder weights already on the
+# Pi (models/terrain.hef, models/yolov8n.hef - see CLAUDE.md §10). They are
+# real, working models today (with the weak-model caveat CLAUDE.md already
+# documents), just not the retrained novelty-layer weights that arrive
+# later - swap hef_path/input_shape/version metadata here when they do.
+# -----------------------------------------------------------------------------
+
+camera:
+  # GUESSED placeholders - NOT a calibrated camera. Every metre-scale number
+  # produced by drone_stack/novelty/perception/projector.py (recipient
+  # position, displacement rate, zone radii) is only as good as these four
+  # values. Calibrate with a standard checkerboard capture before trusting
+  # any novelty-layer distance in flight.
+  fx: 950.0
+  fy: 950.0
+  cx: 640.0
+  cy: 360.0
+  # 0 = nadir (straight down) - the mount this layer's math assumes and the
+  # physically correct one for landing-zone/recipient work (drone must see
+  # what's below it). IMPORTANT: the existing Pi camera on this airframe was
+  # set up for general GCS monitoring, not confirmed nadir - measure the
+  # actual mount angle before flight and correct this value; do not assume
+  # 0 is accurate for the physical rig as wired today.
+  tilt_from_nadir_deg: 0.0
+
+models:
+  terrain:
+    kind: segmenter
+    hef_path: models/terrain.hef
+    input_shape: [384, 640, 1]   # (h, w, c) - CLAUDE.md §10: "Input 384x640, one logit channel"
+    seg_threshold: 0.5
+    binary_fallback:
+      # Today's terrain.hef is binary (walkable / not). See
+      # docs/novelty/landing_zone.md "Model interface" for why 'grass' (not
+      # a generic 'safe' bucket) is the mapped-to class: it is the highest-
+      # suitability class in landing_zone.yaml, so a binary model degrades
+      # to "walkable cells score as the best surface, everything else is
+      # unknown" rather than silently capping every cell's score.
+      safe_class: grass
+      unsafe_class: unknown
+
+  yolov8n:
+    kind: detector
+    hef_path: models/yolov8n.hef
+    input_shape: [640, 640, 3]   # standard yolov8n Hailo export input
+    # Deliberately NOT the GCS overlay's threshold (gcs/cameras.py
+    # _build_hailo_processors uses 0.40 for the on-screen box only). CLAUDE.md
+    # §10 is explicit that both person models peak at only ~0.27-0.37
+    # confidence on clear test people on the CURRENT weak/placeholder
+    # weights - a 0.40 threshold would filter out every real detection and
+    # make the vision channel of §2.2 never succeed. Matches
+    # hailo_infer.py's own module-level default (0.25) instead. RAISE this
+    # once retrained weights arrive and peak confidence is known to clear a
+    # higher bar - see docs/novelty/recipient_auth.md "Known limitations".
+    score_thr: 0.25
