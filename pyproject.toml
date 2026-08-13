@@ -19,6 +19,9 @@ dependencies = [
     "fastapi>=0.110",
     "uvicorn[standard]>=0.29",
     "websockets>=12.0",
+    # Used by gcs/hailo_infer.py and drone_stack/novelty/ (was installed but
+    # undeclared; pinned to the version already verified on the Pi).
+    "numpy>=1.24",
 ]
 
 [project.optional-dependencies]
