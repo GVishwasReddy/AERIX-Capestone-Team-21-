@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "drone_stack"
+version = "1.0.0"
+description = "ROS-free autonomous drone software stack (MAVLink + RPLIDAR) for Raspberry Pi 5"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Drone Stack" }]
+dependencies = [
+    "pymavlink>=2.4.41",
+    "pyserial>=3.5",
+    "PyYAML>=6.0.1",
+    "psutil>=5.9",
+    "Flask>=3.0",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "websockets>=12.0",
+]
+
+[project.optional-dependencies]
+hardware = ["rplidar-roboticia>=1.1.0"]
+dev = ["pytest>=8.0", "pytest-timeout>=2.2"]
+
+[project.scripts]
+drone-stack = "drone_stack.launch.bringup:main"
+drone-gcs = "drone_stack.gcs.server:main"
+
+[tool.setuptools.packages.find]
+include = ["drone_stack*"]
+
+[tool.setuptools.package-data]
+"drone_stack.web" = ["static/*"]
+"drone_stack.gcs" = ["static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+timeout = 60
+addopts = "-ra"

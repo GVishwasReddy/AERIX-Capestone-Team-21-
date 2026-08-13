@@ -1,0 +1,31 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.pytest_cache/
+*.log
+logs/
+.DS_Store
+*.swp
+flight_logs/
+
+# ad-hoc timestamped backups made by editor sessions (not source)
+.claude_backup_*/
+.gcs_backup_*/
+gstshark_*/
+
+# large binary model weights - not source, swapped via config/novelty/models.yaml
+models/*.hef
+
+# runtime logs
+hailort.log
+pyhailort.log
+
+# ad-hoc backup copies left alongside edited files
+*.bak_*
+*.bak.*

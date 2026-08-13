@@ -1,0 +1,41 @@
+# -----------------------------------------------------------------------------
+# REAL HARDWARE profile - deep-merged on top of default.yaml.
+#
+# Edit the two serial ports below to match your wiring, then run:
+#     scripts/run_real.sh
+#
+# Find the ports after plugging in the devices:
+#     ls -l /dev/serial/by-id/          # stable names, recommended
+#     dmesg | grep -Ei 'ttyACM|ttyUSB'
+# -----------------------------------------------------------------------------
+mode: real
+
+logging:
+  level: INFO
+
+mavlink:
+  # Pixhawk 2.4.8 over USB usually enumerates as /dev/ttyACM0.
+  # Prefer a stable by-id path, e.g.:
+  #   /dev/serial/by-id/usb-ArduPilot_Pixhawk1-...-if00
+  connection: "/dev/ttyACM0"
+  baud: 115200
+
+lidar:
+  # RPLIDAR C1 over USB usually enumerates as /dev/ttyUSB0.
+  port: "/dev/ttyUSB0"
+  baud: 460800
+
+web:
+  enabled: true
+  port: 8090
+
+safety:
+  # TEMPORARY (bench testing): the GCS auto-failsafe kept triggering a
+  # geofence/link RTL that the FC refuses without a GPS position estimate.
+  # Set false so the GCS stops commanding RTL while you test on the bench.
+  # Re-enable (true) before real flights.
+  failsafes_enabled: false
+  # 6S LiPo (CNHL 6S 4000mAh) thresholds — the defaults were 4S (14V).
+  battery_low_voltage: 21.6       # 3.6 V/cell -> warn
+  battery_critical_voltage: 20.4  # 3.4 V/cell -> land
+  min_satellites: 6

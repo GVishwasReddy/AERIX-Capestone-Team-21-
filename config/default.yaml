@@ -1,0 +1,158 @@
+# =============================================================================
+# drone_stack - default configuration
+# -----------------------------------------------------------------------------
+# This file holds every tunable parameter with sane defaults. Environment
+# profiles (config/sim.yaml, config/real.yaml) are deep-merged ON TOP of this
+# file, so they only need to specify the handful of values that differ.
+#
+# To go from SIMULATION to REAL HARDWARE you normally only change:
+#     mode:                sim  -> real
+#     mavlink.connection:  udp  -> /dev/ttyACM0   (your Pixhawk serial port)
+#     lidar.port:               -> /dev/ttyUSB0   (your RPLIDAR serial port)
+# Everything else keeps working unchanged.
+# =============================================================================
+
+# "sim"  -> mock Pixhawk + mock LiDAR are used (no hardware required)
+# "real" -> pymavlink + RPLIDAR driver talk to physical devices
+mode: sim
+
+logging:
+  level: INFO            # DEBUG | INFO | WARNING | ERROR
+  dir: logs             # log files are written here (created if missing)
+  console: true
+  max_bytes: 5242880     # 5 MB per rotated log file
+  backup_count: 3
+
+# -----------------------------------------------------------------------------
+# MAVLink / Pixhawk 2.4.8 (ArduPilot)
+# -----------------------------------------------------------------------------
+mavlink:
+  enabled: true
+  # REAL examples:  "/dev/ttyACM0"  "/dev/serial0"  "/dev/ttyAMA0"
+  # SIM  examples:  "udp:127.0.0.1:14550"  (also used to attach to SITL/MAVProxy)
+  connection: "udp:127.0.0.1:14550"
+  baud: 115200               # only used for serial connection strings
+  source_system: 255         # this companion computer's MAVLink system id
+  source_component: 190      # MAV_COMP_ID_ONBOARD_COMPUTER
+  target_system: 1           # the autopilot's system id
+  target_component: 1
+  reconnect_interval_s: 2.0  # wait between reconnection attempts
+  heartbeat_timeout_s: 5.0   # link considered lost after this many seconds
+  request_stream_rate_hz: 10 # data stream rate requested from the autopilot
+  rate_hz: 50                # node service loop rate
+
+# -----------------------------------------------------------------------------
+# Slamtec RPLIDAR C1
+# -----------------------------------------------------------------------------
+lidar:
+  enabled: true
+  port: "/dev/ttyUSB0"       # RPLIDAR USB serial device
+  baud: 460800               # C1 default baudrate
+  frame_id: "lidar_link"
+  rate_hz: 10                # publish rate for assembled scans
+  reconnect_interval_s: 2.0
+  min_range_m: 0.15
+  max_range_m: 12.0
+  angle_offset_deg: 0.0      # mounting offset applied to every beam
+  invert: false              # set true if the unit is mounted upside-down
+
+# -----------------------------------------------------------------------------
+# Sensor fusion (Phase 4) - complementary filter now, EKF-ready interface
+# -----------------------------------------------------------------------------
+fusion:
+  enabled: true
+  rate_hz: 30
+  attitude_alpha: 0.98       # complementary filter weight (gyro vs accel)
+  use_gps: true
+  use_lidar: true
+
+# -----------------------------------------------------------------------------
+# Obstacle detection & classification (Phase 5)
+# -----------------------------------------------------------------------------
+obstacles:
+  enabled: true
+  rate_hz: 10
+  cluster_gap_m: 0.30        # max gap between beams to stay one cluster
+  min_points: 3              # ignore clusters smaller than this
+  danger_distance_m: 2.0     # obstacles closer than this are flagged DANGER
+  person_width_range_m: [0.25, 0.80]
+  pole_width_max_m: 0.35
+  vehicle_width_range_m: [1.20, 4.00]
+  wall_min_length_m: 2.50
+
+# -----------------------------------------------------------------------------
+# Navigation, collision avoidance & safety (Phase 6)
+# -----------------------------------------------------------------------------
+navigation:
+  enabled: true
+  rate_hz: 10
+  waypoint_radius_m: 1.5     # distance at which a waypoint is "reached"
+  cruise_altitude_m: 5.0
+  cruise_speed_ms: 3.0
+  takeoff_altitude_m: 5.0
+  avoidance_distance_m: 2.5  # start avoiding obstacles closer than this
+  avoidance_stop_m: 1.2      # hard stop / brake distance
+  avoidance_enabled: true    # collision avoidance active on startup
+  auto_arm: true             # arm automatically when a mission starts (sim-safe)
+
+safety:
+  battery_low_voltage: 14.0      # 4S nominal; trigger RTL
+  battery_critical_voltage: 13.2 # trigger LAND
+  battery_low_pct: 25
+  battery_critical_pct: 15
+  gcs_link_timeout_s: 3.0        # MAVLink silence before failsafe
+  failsafes_enabled: true        # master switch for GCS-side auto-failsafes
+  min_satellites: 6
+  min_gps_fix_type: 3            # 3 = 3D fix
+  geofence_radius_m: 200.0
+  max_altitude_m: 120.0
+
+# -----------------------------------------------------------------------------
+# Diagnostics (Phase 9)
+# -----------------------------------------------------------------------------
+diagnostics:
+  enabled: true
+  rate_hz: 1
+  cpu_warn_pct: 85.0
+  mem_warn_pct: 85.0
+  temp_warn_c: 80.0
+  sensor_stale_s: 2.0        # sensor considered stale if no data in this time
+
+# -----------------------------------------------------------------------------
+# Web dashboard / visualization (Phase 8) - replaces RViz
+# -----------------------------------------------------------------------------
+web:
+  enabled: true
+  host: "0.0.0.0"
+  port: 8090
+  stream_rate_hz: 10
+
+# -----------------------------------------------------------------------------
+# Simulation world (Phase 7) - only used when mode == "sim"
+# -----------------------------------------------------------------------------
+sim:
+  update_rate_hz: 50
+  start_position: { lat: 47.397742, lon: 8.545594, alt_amsl_m: 488.0 }
+  start_heading_deg: 0.0
+  battery_capacity_v: 16.8       # 4S full charge
+  battery_drain_per_min_v: 0.05
+  # Static obstacles placed in the local ENU frame (metres, relative to start).
+  # type is used by the mock LiDAR to size the return and by tests.
+  obstacles:
+    - { type: wall,    x: 8.0,  y: 0.0,  width: 6.0,  depth: 0.3 }
+    - { type: tree,    x: 5.0,  y: 4.0,  width: 0.6,  depth: 0.6 }
+    - { type: pole,    x: 3.0,  y: -2.5, width: 0.2,  depth: 0.2 }
+    - { type: person,  x: 4.0,  y: -0.5, width: 0.5,  depth: 0.4 }
+    - { type: vehicle, x: 10.0, y: 3.0,  width: 2.0,  depth: 4.0 }
+
+# -----------------------------------------------------------------------------
+# Payload servo — Pixhawk AUX1 (SERVO output ch 9, MG995R)
+# -----------------------------------------------------------------------------
+# The transmitter button on rc_channel toggles the AUX1 servo, edge-triggered so
+# it never fights the GCS "PAYLOAD · AUX1 SERVO" buttons (same set_servo path).
+# HIGH (>1700us) -> release_us, LOW (<1300us) -> lock_us. Values match app.js.
+payload:
+  out_channel: 9      # FC servo output driven (AUX1 == SERVO9)
+  rc_channel: 7       # transmitter input channel that toggles it (Button A)
+  lock_us: 1100       # PWM that holds/locks the payload
+  release_us: 1410    # PWM that releases/drops the payload

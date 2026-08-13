@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>AERIX GROUND CONTROL</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<link rel="stylesheet" href="/static/style.css" />
+</head>
+<body data-theme="dark">
+<header id="hdr">
+  <div class="title">◈ AERIX&nbsp;GROUND&nbsp;CONTROL</div>
+  <div class="pills">
+    <span id="pill-link" class="pill bad">LINK LOST</span>
+    <span id="pill-source" class="pill">SIM</span>
+    <span id="pill-mode" class="pill">STABILIZE</span>
+    <span id="pill-armed" class="pill bad">DISARMED</span>
+  </div>
+  <div class="chips">
+    <span class="chip">🛰 <b id="chip-sat">0</b></span>
+    <span class="chip">🔋 <b id="chip-batt">0.0</b>V</span>
+    <span class="chip">▤ <b id="chip-pkt">0</b></span>
+    <span class="chip">🖥 <b id="chip-cpu">0</b>%</span>
+    <span class="chip" id="chip-clock">--:--:--</span>
+    <button id="theme-toggle" class="theme-btn" title="Toggle light / dark">☀</button>
+  </div>
+</header>
+
+<div class="app">
+  <!-- LEFT SIDEBAR -->
+  <aside class="sidebar">
+    <div class="sect"><h3>SCAN</h3>
+      <div class="btn-col">
+        <button data-cmd="scan_start">Start Scan</button>
+        <button data-cmd="scan_stop">Stop Scan</button>
+        <button data-cmd="scan_pause">Pause</button>
+        <button data-cmd="scan_resume">Resume</button>
+      </div>
+    </div>
+    <div class="sect"><h3>AVOIDANCE</h3>
+      <div class="btn-col">
+        <button id="av-on" data-cmd="avoid_enable" class="tog">Enable Avoid</button>
+        <button id="av-off" data-cmd="avoid_disable" class="tog">Disable Avoid</button>
+        <button id="src-sim" class="tog ok on">Simulation</button>
+        <button id="src-real" class="tog danger">Real Mode</button>
+      </div>
+      <!-- TEMP tuning control: emergency-braking trigger distance. Enter an exact
+           value or drag the slider; both drive the same set_stop_distance command. -->
+      <div class="brake-tune">
+        <label for="brake-dist-num">EMERGENCY BRAKE @
+          <input id="brake-dist-num" type="number" min="0.3" max="8" step="0.1" value="1.2"> m
+        </label>
+        <input id="brake-dist" type="range" min="0.3" max="8" step="0.1" value="1.2">
+      </div>
+    </div>
+    <div class="sect"><h3>FLIGHT OVERRIDE</h3>
+      <div class="btn-row">
+        <button data-cmd="arm" class="ok">ARM</button>
+        <button data-cmd="disarm" class="danger">DISARM</button>
+      </div>
+      <button data-cmd="emergency_stop" class="danger wide">EMERGENCY STOP</button>
+      <button data-cmd="emergency_land" class="amber wide">EMERGENCY LAND</button>
+      <div class="btn-row">
+        <button data-cmd="rtl">RTL</button>
+        <button data-cmd="land">LAND</button>
+      </div>
+    </div>
+    <div class="sect"><h3>PAYLOAD · AUX1 SERVO</h3>
+      <div class="btn-row">
+        <button id="srv-lock">Lock</button>
+      </div>
+      <button id="srv-release" class="amber wide">Release Payload</button>
+    </div>
+    <div class="sect"><h3>DATA</h3>
+      <div class="btn-col">
+        <button id="btn-savescan">Save Scan</button>
+        <button id="btn-record" data-cmd="record">Record Log</button>
+        <button id="btn-replay">Replay .jsonl</button>
+        <select id="log-select" class="select"></select>
+      </div>
+    </div>
+  </aside>
+
+  <!-- RADAR + FLIGHT MODES COLUMN -->
+  <section class="col-radar">
+    <div class="panel radar-panel">
+      <div class="panel-hd">
+        <span id="radar-title">SIMULATION</span>
+        <span class="radar-status">
+          <b id="radar-state">--</b> · <b id="radar-near">--</b> · x<b id="radar-mult">1.0</b>
+        </span>
+        <span class="radar-zoom">
+          <button id="rz-out" title="Zoom out">−</button>
+          <button id="rz-in" title="Zoom in">+</button>
+          <b id="rz-lvl">1.0x</b>
+          <button id="rz-exp" title="Expand">⤢</button>
+        </span>
+      </div>
+      <div class="radar-wrap">
+        <canvas id="radar" width="360" height="360"></canvas>
+        <div id="brake-overlay" class="brake-overlay">EMERGENCY BRAKING</div>
+      </div>
+    </div>
+    <div class="panel modes-panel">
+      <div class="panel-hd"><span>FLIGHT MODE</span></div>
+      <div class="mode-status">
+        Actual: <b id="mode-actual">--</b> &nbsp; Requested: <b id="mode-req">--</b>
+      </div>
+      <div id="mode-grid" class="mode-grid"></div>
+    </div>
+  </section>
+
+  <!-- MAP -->
+  <section class="panel map-panel">
+    <div class="map-toolbar">
+      <span class="layers">
+        <button class="lyr" data-layer="street">Street</button>
+        <button class="lyr on" data-layer="sat">Satellite</button>
+        <button class="lyr" data-layer="terrain">Terrain</button>
+        <button class="lyr" data-layer="dark">Dark</button>
+      </span>
+      <button id="tb-wp">+ WP</button>
+      <button id="tb-upload">Upload</button>
+      <button id="tb-download">Download</button>
+      <button id="tb-clear">Clear</button>
+      <button data-cmd="rtl" class="danger">RTL</button>
+      <button data-cmd="land" class="ok">LAND</button>
+    </div>
+    <div id="map"></div>
+    <div class="map-coords">
+      <div>⌖ <span id="coord-drone" class="green">--</span></div>
+      <div>◎ <span id="coord-cursor" class="cyan">--</span></div>
+    </div>
+    <div class="cams">
+      <div class="cam" id="camwrap0">
+        <img id="camimg0" class="cam-img" alt="" />
+        <div id="camov0" class="cam-ov"></div>
+        <div class="cam-top"><span id="camlbl0">USB --</span><span class="cam-gpu">GPU</span></div>
+      </div>
+      <div class="cam" id="camwrap1">
+        <img id="camimg1" class="cam-img" alt="" />
+        <div id="camov1" class="cam-ov"></div>
+        <div class="cam-top"><span id="camlbl1">P1 --</span><span class="cam-gpu">GPU</span></div>
+      </div>
+    </div>
+    <div id="prop3d-wrap">
+      <div id="prop3d-glass"></div>
+      <div id="prop3d-label">◈ LIVE MODEL</div>
+      <div id="prop3d-canvas-host"></div>
+    </div>
+  </section>
+
+  <!-- BOTTOM ROW: 5 PANELS -->
+  <section class="bottom">
+    <div class="panel"><div class="panel-hd"><span>● Telemetry</span></div>
+      <table id="tbl-telem" class="kv"></table>
+    </div>
+    <div class="panel"><div class="panel-hd"><span>● Avoidance</span></div>
+      <table id="tbl-avoid" class="kv"></table>
+    </div>
+    <div class="panel"><div class="panel-hd"><span>● Mission</span></div>
+      <div class="btn-col">
+        <button id="ms-save">Save .plan</button>
+        <button id="ms-load">Load .plan</button>
+        <button id="ms-clear" data-cmd="clear_mission">Clear All</button>
+      </div>
+      <table id="tbl-mission" class="kv"></table>
+    </div>
+    <div class="panel"><div class="panel-hd"><span>● System Health</span></div>
+      <table id="tbl-health" class="kv"></table>
+      <div id="health-spark" class="sparks"></div>
+    </div>
+    <div class="panel console-panel"><div class="panel-hd"><span>● Console</span></div>
+      <div id="console" class="console"></div>
+      <div class="nl-bar">
+        <input id="nl-input" type="text"
+          placeholder="command in plain English — e.g. take off to 6m then go up 3m" />
+        <button id="nl-send" class="ok">Send ⏎</button>
+      </div>
+      <div id="nl-log" class="nl-log"></div>
+    </div>
+  </section>
+</div>
+
+<input type="file" id="plan-file" accept=".plan,.json" style="display:none" />
+
+<!-- safety confirmation modal -->
+<div id="confirm-overlay" class="confirm-overlay">
+  <div class="confirm-box">
+    <div class="confirm-icon">⚠</div>
+    <div id="confirm-title" class="confirm-title">Are you sure?</div>
+    <div id="confirm-msg" class="confirm-msg"></div>
+    <div class="confirm-actions">
+      <button id="confirm-cancel">Cancel</button>
+      <button id="confirm-ok" class="danger">Confirm</button>
+    </div>
+  </div>
+</div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="/static/app.js?v=1786500000"></script>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+<!-- translucent centre-screen announcement for flight-mode / aux-switch changes -->
+<div id="mode-toast" class="mode-toast"></div>
+<script type="module" src="/static/prop3d.js?v=1786419119"></script>
+</body>
+</html>

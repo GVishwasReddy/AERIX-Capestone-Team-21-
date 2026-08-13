@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>drone_stack dashboard</title>
+<style>
+  :root { --bg:#0d1117; --panel:#161b22; --line:#30363d; --fg:#e6edf3; --accent:#2f81f7;
+          --ok:#3fb950; --warn:#d29922; --err:#f85149; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: ui-monospace, Menlo, Consolas, monospace;
+         background:var(--bg); color:var(--fg); }
+  header { padding:10px 16px; background:var(--panel); border-bottom:1px solid var(--line);
+           display:flex; align-items:center; gap:16px; }
+  header h1 { font-size:16px; margin:0; font-weight:600; }
+  #conn { font-size:12px; padding:2px 8px; border-radius:10px; background:var(--err); }
+  #conn.up { background:var(--ok); }
+  .wrap { display:flex; gap:12px; padding:12px; flex-wrap:wrap; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:12px; }
+  #viz { flex:1 1 560px; min-width:320px; }
+  canvas { width:100%; height:auto; background:#05070a; border-radius:6px; display:block; }
+  #side { flex:0 0 300px; display:flex; flex-direction:column; gap:12px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  td { padding:3px 4px; border-bottom:1px solid var(--line); }
+  td.k { color:#8b949e; }
+  td.v { text-align:right; }
+  .btns { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+  button { font-family:inherit; font-size:13px; padding:8px; border-radius:6px; cursor:pointer;
+           border:1px solid var(--line); background:#21262d; color:var(--fg); }
+  button:hover { border-color:var(--accent); }
+  button.danger { background:#3d1418; border-color:var(--err); color:#ffb4ac; }
+  #diag div { font-size:12px; padding:2px 0; display:flex; justify-content:space-between; }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; }
+  .legend { font-size:11px; color:#8b949e; margin-top:6px; line-height:1.6; }
+  .sw { display:inline-block; width:10px; height:10px; border-radius:2px; margin:0 4px 0 10px; vertical-align:middle;}
+</style>
+</head>
+<body>
+<header>
+  <h1>drone_stack</h1>
+  <span id="conn">disconnected</span>
+  <span id="phase" style="font-size:13px; color:#8b949e;"></span>
+</header>
+<div class="wrap">
+  <div class="card" id="viz">
+    <canvas id="c" width="720" height="720"></canvas>
+    <div class="legend">
+      <span class="sw" style="background:#3fb950"></span>lidar
+      <span class="sw" style="background:#f85149"></span>danger obstacle
+      <span class="sw" style="background:#d29922"></span>obstacle
+      <span class="sw" style="background:#2f81f7"></span>waypoint
+      &nbsp; grid = 1&nbsp;m &nbsp; up = forward
+    </div>
+  </div>
+  <div id="side">
+    <div class="card">
+      <div style="font-size:13px; margin-bottom:6px; color:#8b949e;">Command the drone (plain English)</div>
+      <textarea id="nlinput" rows="2" placeholder="e.g. take off to 5m, then go up 3m and stay"
+        style="width:100%; background:#0d1117; color:var(--fg); border:1px solid var(--line);
+               border-radius:6px; padding:8px; font-family:inherit; font-size:13px; resize:vertical;"></textarea>
+      <div style="display:flex; gap:8px; margin-top:8px;">
+        <button style="flex:1" onclick="sendNL()">Send &#9166;</button>
+        <button onclick="document.getElementById('nlinput').value=''">Clear</button>
+      </div>
+      <div id="nllog" style="margin-top:8px; font-size:12px; max-height:150px; overflow:auto;"></div>
+    </div>
+    <div class="card">
+      <table id="telem"><tbody></tbody></table>
+    </div>
+    <div class="card">
+      <div class="btns">
+        <button onclick="svc('start_mission')">Start</button>
+        <button onclick="svc('hold')">Hold</button>
+        <button onclick="svc('resume')">Resume</button>
+        <button onclick="svc('rtl')">RTL</button>
+        <button onclick="svc('land')">Land</button>
+        <button class="danger" onclick="svc('emergency_stop')">EMERGENCY</button>
+      </div>
+    </div>
+    <div class="card"><div id="diag"></div></div>
+  </div>
+</div>
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const W = canvas.width, H = canvas.height;
+let SCALE = 26;           // pixels per metre
+let latest = {};
+
+function svc(name){
+  fetch('/api/service', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({name})}).then(r=>r.json()).then(r=>{
+      console.log('service', name, r);
+    });
+}
+
+function nlLog(text, ok){
+  const log = document.getElementById('nllog');
+  const color = ok===undefined ? '#8b949e' : (ok ? 'var(--ok)' : 'var(--err)');
+  const div = document.createElement('div');
+  div.style.cssText = 'padding:3px 0; border-bottom:1px solid var(--line); color:'+color;
+  div.textContent = text;
+  log.prepend(div);
+}
+
+function sendNL(){
+  const el = document.getElementById('nlinput');
+  const text = el.value.trim();
+  if(!text) return;
+  nlLog('> ' + text);
+  fetch('/api/service', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({name:'nl_command', params:{text}})})
+    .then(r=>r.json())
+    .then(r=>{ nlLog((r.success?'✓ ':'✗ ') + (r.message||''), r.success); })
+    .catch(e=>{ nlLog('✗ error sending command', false); });
+  el.value = '';
+}
+
+// Enter sends; Shift+Enter makes a newline.
+document.addEventListener('DOMContentLoaded', ()=>{
+  const el = document.getElementById('nlinput');
+  if(el) el.addEventListener('keydown', (e)=>{
+    if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); sendNL(); }
+  });
+});
+
+function bodyToScreen(fwd, left){
+  // forward = up (-y screen), left = left (-x screen)
+  return [W/2 - left*SCALE, H/2 - fwd*SCALE];
+}
+
+function draw(){
+  ctx.clearRect(0,0,W,H);
+  // grid
+  ctx.strokeStyle = '#12181f'; ctx.lineWidth = 1;
+  for(let m=-12; m<=12; m++){
+    let [x1,y1]=bodyToScreen(m,-12),[x2,y2]=bodyToScreen(m,12);
+    ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
+    let [x3,y3]=bodyToScreen(-12,m),[x4,y4]=bodyToScreen(12,m);
+    ctx.beginPath(); ctx.moveTo(x3,y3); ctx.lineTo(x4,y4); ctx.stroke();
+  }
+  // range rings
+  ctx.strokeStyle = '#1b2430';
+  for(const r of [2,4,6,8,10]){
+    ctx.beginPath(); ctx.arc(W/2,H/2,r*SCALE,0,2*Math.PI); ctx.stroke();
+  }
+
+  // lidar scan
+  const scan = latest.scan;
+  if(scan && scan.ranges){
+    ctx.fillStyle = '#3fb950';
+    const a0 = scan.angle_min, inc = scan.angle_increment;
+    for(let i=0;i<scan.ranges.length;i++){
+      const r = scan.ranges[i];
+      if(r===null || r===undefined || !isFinite(r)) continue;
+      const a = a0 + i*inc;
+      const fwd = r*Math.cos(a), left = r*Math.sin(a);
+      const [px,py] = bodyToScreen(fwd,left);
+      ctx.fillRect(px-1.5,py-1.5,3,3);
+    }
+  }
+
+  // obstacles
+  const obs = latest.obstacles;
+  if(obs && obs.obstacles){
+    for(const o of obs.obstacles){
+      const [px,py] = bodyToScreen(o.x_m, o.y_m);
+      ctx.fillStyle = o.danger ? '#f85149' : '#d29922';
+      ctx.beginPath(); ctx.arc(px,py,5,0,2*Math.PI); ctx.fill();
+      ctx.fillStyle = '#c9d1d9'; ctx.font = '11px monospace';
+      ctx.fillText(`${o.classification} ${o.distance_m.toFixed(1)}m`, px+8, py+3);
+    }
+  }
+
+  // waypoints (transform ENU plan into body frame using drone state)
+  const st = latest.state, plan = latest.plan, mission = latest.mission;
+  if(plan && plan.waypoints && st){
+    const yaw = st.yaw || 0;
+    const cy = Math.cos(yaw), sy = Math.sin(yaw);
+    ctx.strokeStyle = '#2f81f7'; ctx.lineWidth = 1.5; ctx.beginPath();
+    let started = false;
+    for(const wp of plan.waypoints){
+      const re = wp.x_m - st.x, rn = wp.y_m - st.y;
+      const fwd = re*cy + rn*sy;      // along forward
+      const left = -re*sy + rn*cy;    // along left
+      const [px,py] = bodyToScreen(fwd,left);
+      if(!started){ ctx.moveTo(px,py); started=true; } else ctx.lineTo(px,py);
+      ctx.fillStyle = (mission && wp.seq===mission.current_wp) ? '#79c0ff' : '#2f81f7';
+      ctx.fillRect(px-3,py-3,6,6);
+    }
+    ctx.stroke();
+  }
+
+  // drone at centre (triangle pointing up = forward)
+  ctx.fillStyle = '#e6edf3';
+  ctx.beginPath();
+  ctx.moveTo(W/2, H/2-10); ctx.lineTo(W/2-7, H/2+8); ctx.lineTo(W/2+7, H/2+8);
+  ctx.closePath(); ctx.fill();
+}
+
+function row(k,v){ return `<tr><td class="k">${k}</td><td class="v">${v}</td></tr>`; }
+function fmt(x,d=1){ return (x===undefined||x===null)?'--':Number(x).toFixed(d); }
+
+function updatePanels(){
+  const t = latest, b=t.battery||{}, s=t.state||{}, m=t.mission||{}, mode=t.mode||{},
+        gps=t.gps||{}, armed=t.armed||{}, link=t.link||{}, alt=t.altitude||{}, d=t.diagnostics||{};
+  document.getElementById('phase').textContent = m.phase ? `${m.phase} — ${m.message||''}` : '';
+  let html = '';
+  html += row('mode', mode.mode_name||'--');
+  html += row('armed', armed.armed? '<span style="color:var(--err)">ARMED</span>':'disarmed');
+  html += row('phase', m.phase||'--');
+  html += row('waypoint', `${m.current_wp??'-'}/${m.total_wp??'-'}`);
+  html += row('dist to wp', fmt(m.distance_to_wp_m,1)+' m');
+  html += row('avoiding', m.avoiding? '<span style="color:var(--warn)">yes</span>':'no');
+  html += row('alt (rel)', fmt(s.alt_rel_m ?? alt.relative_m,1)+' m');
+  html += row('ground spd', fmt(Math.hypot(s.vx||0,s.vy||0),1)+' m/s');
+  html += row('battery', fmt(b.voltage_v,2)+' V ('+fmt(b.remaining_pct,0)+'%)');
+  html += row('GPS', (gps.satellites??'--')+' sats fix'+(gps.fix_type??'-'));
+  html += row('link', link.connected? '<span style="color:var(--ok)">up</span>':'<span style="color:var(--err)">down</span>');
+  html += row('CPU / MEM', fmt(d.cpu_pct,0)+'% / '+fmt(d.mem_pct,0)+'%');
+  document.querySelector('#telem tbody').innerHTML = html;
+
+  // diagnostics list
+  const colors = {OK:'var(--ok)', WARN:'var(--warn)', STALE:'var(--warn)', ERROR:'var(--err)'};
+  let dh = '';
+  (d.diagnostics||[]).forEach(x=>{
+    dh += `<div><span><span class="dot" style="background:${colors[x.level]||'#888'}"></span>${x.name}</span><span>${x.message}</span></div>`;
+  });
+  document.getElementById('diag').innerHTML = dh || '<div style="color:#8b949e">no diagnostics yet</div>';
+}
+
+function connect(){
+  const es = new EventSource('/stream');
+  const conn = document.getElementById('conn');
+  es.onopen = ()=>{ conn.textContent='connected'; conn.classList.add('up'); };
+  es.onerror = ()=>{ conn.textContent='reconnecting'; conn.classList.remove('up'); };
+  es.onmessage = (e)=>{ try{ latest = JSON.parse(e.data); draw(); updatePanels(); }catch(err){} };
+}
+connect();
+setInterval(draw, 100);  // keep animating even between SSE frames
+</script>
+</body>
+</html>

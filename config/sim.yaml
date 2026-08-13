@@ -1,0 +1,17 @@
+# -----------------------------------------------------------------------------
+# SIMULATION profile - deep-merged on top of default.yaml.
+# No hardware required. Run with:  scripts/run_sim.sh
+# -----------------------------------------------------------------------------
+mode: sim
+
+logging:
+  level: INFO
+
+# In sim the connection string is irrelevant (the mock Pixhawk is used), but we
+# keep a valid value so switching mode->real needs only this one edit + ports.
+mavlink:
+  connection: "udp:127.0.0.1:14550"
+
+web:
+  enabled: true
+  port: 8090

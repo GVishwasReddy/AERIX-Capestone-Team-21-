@@ -1,0 +1,15 @@
+# Core runtime dependencies (simulation + real hardware share these).
+# Everything here is pure-Python / wheels available for aarch64 (Raspberry Pi 5).
+pymavlink>=2.4.41
+pyserial>=3.5
+PyYAML>=6.0.1
+psutil>=5.9
+Flask>=3.0
+
+# Drone GCS (FastAPI + WebSocket) web application
+fastapi>=0.110
+uvicorn[standard]>=0.29
+websockets>=12.0
+
+# Hardware-only dependencies live in requirements-hardware.txt so that a
+# development machine (or the simulator) does not need them installed.

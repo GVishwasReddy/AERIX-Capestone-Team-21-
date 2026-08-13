@@ -1,0 +1,7 @@
+# Dependencies required only when talking to real hardware.
+# Install on the Raspberry Pi with:  pip install -r requirements-hardware.txt
+-r requirements.txt
+
+# Slamtec RPLIDAR driver (used by drone_stack.interfaces.lidar_interface.RealLidar).
+# Imported lazily, so its absence never breaks simulation.
+rplidar-roboticia>=1.1.0
