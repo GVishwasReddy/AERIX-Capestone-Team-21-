@@ -22,6 +22,10 @@ dependencies = [
     # Used by gcs/hailo_infer.py and drone_stack/novelty/ (was installed but
     # undeclared; pinned to the version already verified on the Pi).
     "numpy>=1.24",
+    # Used by drone_stack/novelty/config.py for fail-loud config validation.
+    # Already present transitively via fastapi; declared directly so a future
+    # fastapi upgrade can't silently drop or downgrade it under us.
+    "pydantic>=2.0",
 ]
 
 [project.optional-dependencies]
