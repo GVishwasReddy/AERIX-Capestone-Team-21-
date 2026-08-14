@@ -89,8 +89,11 @@ class GcsHub:
         self._replay_frames: list[dict] | None = None
         self._replay_idx = 0
 
-        # live cameras (USB C270 + Pi cam); lazy-start on first stream request
-        self.cameras = CameraManager()
+        # live cameras (USB C270 + Pi cam); lazy-start on first stream request.
+        # Shares self.bus so the novelty-layer overlay processors can publish
+        # PersonDetection/SegmentationFrame for DeliveryNode - see
+        # cameras.py's own "Novelty layer tap" docstring section.
+        self.cameras = CameraManager(bus=self.bus)
 
         self._console_handler = _ConsoleHandler(self._push_console)
         logging.getLogger("drone").addHandler(self._console_handler)
@@ -381,6 +384,8 @@ class GcsHub:
             return self.replay(p.get("file", ""))
         if cmd == "set_source":
             return self.set_source(p.get("mode", "sim"))
+        if cmd == "ble_auth_event":
+            return self._on_ble_auth_event(p)
         if cmd == "set_servo":
             # Payload servo on a Pixhawk AUX output (AUX1 == channel 9).
             ch = int(p.get("channel", 9))
@@ -398,6 +403,38 @@ class GcsHub:
             r = self.services.call(cmd, **p)
             return {"ok": r.success, "message": r.message, "data": r.data}
         return {"ok": False, "message": f"unknown command: {cmd}"}
+
+    def _on_ble_auth_event(self, p: dict) -> dict:
+        """Bridge for the BLE peripheral process (``ble_handshake/
+        drone_ble_peripheral.py`` - a separate asyncio/D-Bus process, not a
+        drone_stack node) onto the novelty layer's own bus. BLE carries NO
+        release power of its own since the re-gate (project plan §9's "BLE
+        release path" decision) - this only publishes a signal that
+        ``DeliveryNode``'s ``DualFactorAuthenticator`` (§2.2) reads
+        alongside the independent vision channel; release itself only ever
+        happens through the mission FSM's own ``RELEASING`` state.
+
+        Imported lazily so ``hub.py`` (core GCS) does not pick up an
+        unconditional dependency on the optional ``drone_stack.novelty``
+        package - matches the lazy-import pattern already used by
+        ``perception/model_registry.py``. Publishing is safe even when
+        ``novelty.enabled`` is false: with no ``DeliveryNode`` subscribed,
+        this is an inert latched publish, not an error.
+        """
+        from drone_stack.novelty.topics import NoveltyTopics
+        from drone_stack.novelty.types import BleAuthEvent
+
+        phone_gps = p.get("phone_gps")
+        event = BleAuthEvent(
+            authenticated=bool(p.get("authenticated", False)),
+            rssi_dbm=p.get("rssi_dbm"),
+            phone_gps=tuple(phone_gps) if phone_gps else None,
+        )
+        self.bus.publish(NoveltyTopics.BLE_AUTH_EVENT, event)
+        self._push_console(
+            "INFO", "ble", f"BLE auth event: authenticated={event.authenticated}"
+        )
+        return {"ok": True, "message": "ble auth event published"}
 
     def _home_or(self, default_lat: float, default_lon: float) -> tuple[float, float]:
         return self._home if self._home is not None else (default_lat, default_lon)

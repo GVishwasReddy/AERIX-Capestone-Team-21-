@@ -30,3 +30,15 @@ max_search_radius_m: 30.0
 # The brief specifies exactly one retry for disambiguation (§2.5); kept
 # configurable rather than hardcoded per §7 ("no magic numbers").
 max_hover_retries: 1
+
+# Altitude (alt_rel_m) above the chosen landing zone at which DESCENDING
+# hands off to AUTHENTICATING - the hover height where recipient auth and
+# release happen, before final touchdown. GUESSED - low enough for reliable
+# BLE RSSI + a close vision view of the recipient, high enough to still
+# re-ascend safely on an abort.
+descent_hover_altitude_m: 2.0
+
+# Altitude (alt_rel_m) at which ASCENDING hands off to RTL after a
+# successful release. GUESSED - matches navigation.yaml's typical cruise
+# altitude so RTL starts from a familiar height.
+ascend_target_altitude_m: 8.0

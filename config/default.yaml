@@ -156,3 +156,16 @@ payload:
   rc_channel: 7       # transmitter input channel that toggles it (Button A)
   lock_us: 1100       # PWM that holds/locks the payload
   release_us: 1410    # PWM that releases/drops the payload
+
+# -----------------------------------------------------------------------------
+# Novelty layer — autonomous markerless delivery (drone_stack/novelty/)
+# -----------------------------------------------------------------------------
+# Off by default: the layer is additive and optional (see the project plan's
+# own architecture note) - launch/bringup.py only constructs DeliveryNode when
+# this is true. Its own five config/novelty/*.yaml files hold every
+# algorithmic threshold; this section only carries bringup-level wiring.
+novelty:
+  enabled: false
+  rate_hz: 5.0              # DeliveryNode control-loop rate
+  flight_logs_dir: flight_logs   # EvidenceLogger JSONL output directory
+  repo_dir: .                     # for the evidence log's git-hash stamp

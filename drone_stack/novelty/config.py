@@ -126,6 +126,16 @@ class MissionFsmConfig(_StrictModel):
     search_radius_expansion_m: float
     max_search_radius_m: float
     max_hover_retries: int
+    descent_hover_altitude_m: float = Field(
+        description="Altitude (alt_rel_m) above the chosen landing zone at "
+        "which DESCENDING hands off to AUTHENTICATING (AltitudeReachedEvent) "
+        "- the hover height authentication and release happen at, before the "
+        "final touchdown. See docs/novelty/mission_fsm.md."
+    )
+    ascend_target_altitude_m: float = Field(
+        description="Altitude (alt_rel_m) at which ASCENDING hands off to "
+        "RTL (AscendCompleteEvent) after a successful release."
+    )
 
     @model_validator(mode="after")
     def _all_states_bounded(self) -> "MissionFsmConfig":
@@ -138,6 +148,13 @@ class MissionFsmConfig(_StrictModel):
         unknown = set(self.state_timeout_s) - {s.value for s in MissionState}
         if unknown:
             raise ValueError(f"state_timeout_s has unknown states: {sorted(unknown)}")
+        if self.descent_hover_altitude_m <= 0:
+            raise ValueError("descent_hover_altitude_m must be > 0")
+        if self.ascend_target_altitude_m <= self.descent_hover_altitude_m:
+            raise ValueError(
+                "ascend_target_altitude_m must be > descent_hover_altitude_m "
+                "(ascent climbs out above the hover/release altitude)"
+            )
         return self
 
 
@@ -150,6 +167,20 @@ class MotionMonitorConfig(_StrictModel):
     zone_intrusion_radius_m: float
     track_history_len: int
     min_track_frames: int
+    max_association_distance_m: float = Field(
+        description="Frame-to-frame tracking gate: a new detection is matched "
+        "to an existing track only if it falls within this ground distance of "
+        "that track's last known position; otherwise it starts a new track. "
+        "See docs/novelty/motion_monitor.md 'Track association'."
+    )
+
+    @model_validator(mode="after")
+    def _positive_history_window(self) -> "MotionMonitorConfig":
+        if self.track_history_len < 1:
+            raise ValueError("track_history_len must be >= 1")
+        if self.min_track_frames < 1 or self.min_track_frames > self.track_history_len:
+            raise ValueError("min_track_frames must be between 1 and track_history_len")
+        return self
 
 
 # --------------------------------------------------------------------------- #
@@ -190,17 +221,58 @@ class ModelSpecConfig(_StrictModel):
     hef_path: str
     input_shape: tuple[int, int, int]  # (h, w, c)
     score_thr: float | None = None                  # detector only
-    seg_threshold: float | None = None               # segmenter only
-    binary_fallback: BinaryFallback | None = None     # segmenter only
+    seg_threshold: float | None = None               # binary segmenter only (sigmoid threshold)
+    binary_fallback: BinaryFallback | None = None     # binary segmenter only
+    class_map: list[TerrainClass] | None = Field(
+        default=None,
+        description="Multi-class segmenter only. Ordered list of TerrainClass "
+        "values, one per output channel in the .hef's own channel order "
+        "(index i of this list <-> output channel i). The adapter argmaxes "
+        "per pixel and looks up the winning channel here - see "
+        "MultiClassSegmenterAdapter.",
+    )
 
     @model_validator(mode="after")
     def _kind_specific_fields(self) -> "ModelSpecConfig":
-        if self.kind == "detector" and self.score_thr is None:
-            raise ValueError("detector models require score_thr")
-        if self.kind == "segmenter" and self.seg_threshold is None:
-            raise ValueError("segmenter models require seg_threshold")
-        if self.kind == "segmenter" and self.binary_fallback is None:
-            raise ValueError("segmenter models require binary_fallback")
+        if self.kind == "detector":
+            if self.score_thr is None:
+                raise ValueError("detector models require score_thr")
+            if self.seg_threshold is not None or self.binary_fallback is not None \
+                    or self.class_map is not None:
+                raise ValueError(
+                    "detector models must not set segmenter-only fields "
+                    "(seg_threshold / binary_fallback / class_map)"
+                )
+            return self
+
+        # kind == "segmenter"
+        if self.score_thr is not None:
+            raise ValueError("segmenter models must not set score_thr")
+        is_binary = self.binary_fallback is not None
+        is_multiclass = self.class_map is not None
+        if is_binary and is_multiclass:
+            raise ValueError(
+                "segmenter models must set exactly one of binary_fallback "
+                "(legacy sigmoid model) or class_map (argmax model), not both"
+            )
+        if not is_binary and not is_multiclass:
+            raise ValueError(
+                "segmenter models require exactly one of binary_fallback "
+                "(legacy sigmoid model) or class_map (multi-class argmax model)"
+            )
+        if is_binary and self.seg_threshold is None:
+            raise ValueError("binary segmenter models (binary_fallback set) require seg_threshold")
+        if is_multiclass:
+            if self.seg_threshold is not None:
+                raise ValueError(
+                    "multi-class segmenter models (class_map set) must not set "
+                    "seg_threshold - argmax has no threshold"
+                )
+            if len(self.class_map) < 2:
+                raise ValueError(
+                    "class_map must list at least 2 TerrainClass values (one "
+                    "per output channel, in channel order)"
+                )
         return self
 
 

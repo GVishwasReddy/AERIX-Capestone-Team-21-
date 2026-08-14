@@ -4,14 +4,18 @@ All neural inference runs on the **Hailo-8 (26 TOPS) NPU**, never on the Pi CPU.
 A single scheduler-backed ``VDevice`` is shared by every model so the two camera
 threads can run concurrently and the HailoRT scheduler time-slices the device.
 
-Two model wrappers:
+Three model wrappers:
 
 * ``Detector``  - ``yolov8n.hef`` (single class = person, on-chip NMS). Returns
                   boxes in the *original* frame's pixel coordinates and draws
                   bounding boxes + labels. Used on the **Pi camera**.
-* ``Segmenter`` - ``terrain.hef`` (384x640 -> 384x640x1 logit map). Sigmoid +
-                  threshold -> translucent colour overlay. Used on the **USB
-                  webcam**.
+* ``Segmenter`` - legacy binary ``terrain.hef`` (384x640 -> 384x640x1 logit
+                  map). Sigmoid + threshold -> translucent colour overlay.
+* ``MultiClassSegmenter`` - genuinely multi-class terrain model (e.g.
+                  ``fabseg.hef``, 7 classes matching
+                  ``drone_stack.novelty.types.TerrainClass``). Per-pixel
+                  argmax over the output's class-logit channels -> an int8
+                  class-index map. No sigmoid/threshold - argmax has none.
 
 Everything degrades gracefully: if HailoRT / a HEF is unavailable the wrappers
 become no-ops (``ok == False``) and the camera simply serves the raw frame, so
@@ -240,3 +244,47 @@ class Segmenter(_Model):
         cv2.putText(frame_bgr, "TERRAIN", (8, fh - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 120), 2, cv2.LINE_AA)
         return frame_bgr
+
+
+class MultiClassSegmenter(_Model):
+    """Genuinely multi-class terrain segmentation (e.g. ``fabseg.hef``).
+
+    Unlike ``Segmenter`` (one sigmoid logit channel -> boolean mask), the
+    output here has one channel per class; the class at each pixel is
+    ``argmax`` over those channels, not a threshold. ``num_classes`` must
+    match the class-channel count the .hef was exported with (verified
+    against ``config/novelty/models.yaml``'s ``class_map`` length by
+    ``MultiClassSegmenterAdapter`` - see ``drone_stack/novelty/perception/
+    adapters.py``).
+    """
+
+    def __init__(self, hef_path: str, name: str = "terrain_mc",
+                 num_classes: int = 7) -> None:
+        super().__init__(hef_path, name)
+        self.num_classes = num_classes
+
+    def infer_class_map(self, frame_bgr: np.ndarray) -> Optional[np.ndarray]:
+        """Return an int8 (h, w) class-index map at MODEL resolution, or None."""
+        if not self.ok:
+            return None
+        h_in, w_in, _ = self._in_hw
+        resized = cv2.resize(frame_bgr, (w_in, h_in), interpolation=cv2.INTER_LINEAR)
+        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+        outs = self._run(rgb)
+        if outs is None:
+            return None
+        logits = outs[self._out_names[0]]
+        # HailoRT may report NHWC or NCHW for the output tensor depending on
+        # how the .hef was compiled - pick whichever axis actually holds one
+        # entry per class rather than assuming a fixed layout.
+        if logits.ndim >= 1 and logits.shape[-1] == self.num_classes:
+            class_map = np.argmax(logits, axis=-1)
+        elif logits.ndim >= 1 and logits.shape[0] == self.num_classes:
+            class_map = np.argmax(logits, axis=0)
+        else:
+            _log.warning(
+                "MultiClassSegmenter(%s): output shape %s has no axis of "
+                "size num_classes=%d - cannot argmax", self.name,
+                logits.shape, self.num_classes)
+            return None
+        return class_map.reshape(h_in, w_in).astype(np.int8)

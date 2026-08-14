@@ -67,6 +67,8 @@ import math
 from dataclasses import dataclass
 from typing import Protocol
 
+import numpy as np
+
 from drone_stack.novelty.types import GroundPoint
 
 
@@ -76,6 +78,20 @@ class GroundProjector(Protocol):
     ) -> GroundPoint | None:
         """Project one pixel to a body-relative ground point, or None if the
         ray does not intersect the ground (points at/above the horizon)."""
+        ...
+
+    def pixels_to_ground(
+        self, px: np.ndarray, py: np.ndarray, altitude_m: float, frame_shape: tuple[int, int]
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Vectorised batch form of :meth:`pixel_to_ground`, for callers that
+        must project every pixel of a frame (landing_zone.py's grid
+        rasteriser - a Python-level loop over ~240k segmentation pixels is
+        too slow). Returns ``(ground_x_m, ground_y_m, valid)`` arrays shaped
+        like ``px``/``py``; ``valid[i]`` is False (x/y are 0.0 there)
+        wherever the ray misses the ground, matching ``pixel_to_ground``'s
+        ``None`` case elementwise. Must implement the identical formula as
+        ``pixel_to_ground`` - this stays the ONE place pixel->ground math
+        lives, per the module docstring."""
         ...
 
 
@@ -139,3 +155,26 @@ class FlatEarthPinhole:
         if p0 is None or p1 is None:
             return None
         return p0.distance_to(p1) / dt_s
+
+    def pixels_to_ground(
+        self, px: np.ndarray, py: np.ndarray, altitude_m: float, frame_shape: tuple[int, int]
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        px = np.asarray(px, dtype=float)
+        py = np.asarray(py, dtype=float)
+        if altitude_m <= 0:
+            zeros = np.zeros_like(px)
+            return zeros, zeros, np.zeros_like(px, dtype=bool)
+        rx = (px - self.cx) / self.fx
+        ry = (py - self.cy) / self.fy
+        f, r, d = self._body_basis()
+        dir_x = rx * r[0] + ry * d[0] + f[0]
+        dir_y = rx * r[1] + ry * d[1] + f[1]
+        dir_z = rx * r[2] + ry * d[2] + f[2]
+        valid = dir_z < 0.0
+        # Avoid dividing by zero for invalid rays; their outputs are masked
+        # out below regardless of what safe_dir_z produces.
+        safe_dir_z = np.where(valid, dir_z, -1.0)
+        t = -altitude_m / safe_dir_z
+        x_m = np.where(valid, t * dir_x, 0.0)
+        y_m = np.where(valid, t * dir_y, 0.0)
+        return x_m, y_m, valid

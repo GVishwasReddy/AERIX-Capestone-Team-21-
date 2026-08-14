@@ -81,3 +81,34 @@ def test_compute_model_version_hashes_real_file(tmp_path):
     assert "@" in version
     # Same bytes -> same hash, deterministic.
     assert compute_model_version(hef) == version
+
+
+def test_registry_builds_multiclass_adapter_from_class_map_spec(tmp_path):
+    """A models.yaml entry with class_map (e.g. fabseg.hef) must select
+    MultiClassSegmenterAdapter, not the legacy binary SegmenterAdapter -
+    and still degrade gracefully with no real Hailo hardware present."""
+    import copy
+
+    import numpy as np
+
+    from drone_stack.novelty.perception.adapters import MultiClassSegmenterAdapter
+    from tests.novelty.conftest import MODELS, write_config_dir
+
+    models = copy.deepcopy(MODELS)
+    del models["models"]["terrain"]["binary_fallback"]
+    del models["models"]["terrain"]["seg_threshold"]
+    models["models"]["terrain"]["class_map"] = [
+        "grass", "pavement", "dirt", "water", "vegetation", "obstacle", "unknown",
+    ]
+    write_config_dir(tmp_path, overrides={"models.yaml": models})
+
+    cfg = NoveltyConfig.load(tmp_path)
+    registry = ModelRegistry.from_config(cfg.models)
+
+    terrain = registry.get("terrain")
+    assert isinstance(terrain, MultiClassSegmenterAdapter)
+    assert terrain.ok is False  # hef doesn't exist at this repo-relative path here
+
+    out = terrain.infer(np.zeros((384, 640, 3), dtype=np.uint8))
+    assert out.kind == "terrain"
+    assert out.segmentation is None

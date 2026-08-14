@@ -83,8 +83,10 @@ class SegmenterAdapter:
     ``binary_fallback``) name which two :class:`TerrainClass` values that
     maps onto, so landing_zone.py always sees the same 7-class vocabulary
     regardless of whether the underlying model is binary or multi-class. A
-    multi-class .hef drops in by pointing this at a different adapter/kind
-    in models.yaml - no code change here.
+    genuinely multi-class .hef (e.g. ``fabseg.hef``) uses
+    :class:`MultiClassSegmenterAdapter` instead (selected by
+    ``model_registry.py`` from whether the spec sets ``class_map`` or
+    ``binary_fallback``) - landing_zone.py never has to know which one ran.
     """
 
     def __init__(
@@ -131,5 +133,62 @@ class SegmenterAdapter:
         frame = SegmentationFrame(
             class_indices=class_indices,
             index_to_class={0: self._unsafe_class, 1: self._safe_class},
+        )
+        return ModelOutput(kind="terrain", segmentation=frame, model_version=self._version)
+
+
+class MultiClassSegmenterAdapter:
+    """Wraps ``drone_stack.gcs.hailo_infer.MultiClassSegmenter`` (a genuine
+    N-class terrain model, e.g. ``fabseg.hef``) behind :class:`VisionModel`.
+
+    ``class_map`` (from ``config/novelty/models.yaml``'s ``models.<name>.
+    class_map``) is the .hef's own output-channel order, index-for-index -
+    channel ``i`` is ``class_map[i]``. This adapter's only job is turning a
+    raw per-pixel argmax into the same ``SegmentationFrame`` /
+    ``TerrainClass`` vocabulary :class:`SegmenterAdapter` already produces,
+    so ``landing_zone.py`` never has to know which adapter produced the
+    frame it's scoring.
+    """
+
+    def __init__(
+        self,
+        hef_path: str,
+        name: str,
+        input_shape: tuple[int, int, int],
+        version: str,
+        class_map: list[TerrainClass],
+    ) -> None:
+        from drone_stack.gcs.hailo_infer import MultiClassSegmenter
+
+        self._input_shape = input_shape
+        self._version = version
+        self._index_to_class = {i: cls for i, cls in enumerate(class_map)}
+        self._seg = None
+        try:
+            self._seg = MultiClassSegmenter(hef_path, name=name, num_classes=len(class_map))
+        except Exception as exc:  # noqa: BLE001 - see module docstring
+            _log.warning("MultiClassSegmenterAdapter(%s): Hailo unavailable (%s) - ok=False", name, exc)
+
+    @property
+    def input_shape(self) -> tuple[int, int, int]:
+        return self._input_shape
+
+    @property
+    def version(self) -> str:
+        return self._version
+
+    @property
+    def ok(self) -> bool:
+        return self._seg is not None and bool(self._seg.ok)
+
+    def infer(self, frame_bgr: np.ndarray) -> ModelOutput:
+        if self._seg is None:
+            return ModelOutput(kind="terrain", segmentation=None, model_version=self._version)
+        class_map = self._seg.infer_class_map(frame_bgr)  # int8 (h, w) at MODEL resolution, or None
+        if class_map is None:
+            return ModelOutput(kind="terrain", segmentation=None, model_version=self._version)
+        frame = SegmentationFrame(
+            class_indices=class_map,
+            index_to_class=dict(self._index_to_class),
         )
         return ModelOutput(kind="terrain", segmentation=frame, model_version=self._version)

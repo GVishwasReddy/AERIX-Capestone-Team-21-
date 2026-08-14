@@ -17,6 +17,19 @@ skipping) so the CPU cost is bounded.
 Everything degrades gracefully: if a camera (or its library, or the Hailo HAT)
 is missing the stream simply reports ``connected: False`` / serves the raw frame,
 so the GCS still runs in pure simulation with no hardware attached.
+
+## Novelty layer tap (project plan §9, step 6)
+
+Processors are built by ``_build_novelty_processors`` (not the legacy
+``drone_stack.gcs.hailo_infer.Detector``/``Segmenter`` construction
+directly) via ``drone_stack.novelty.perception.model_registry.ModelRegistry``
+- the SAME frame is never re-captured (the camera device cannot be opened
+twice), so this is the ONE place inference can run: once per kept frame,
+publishing the structured result (``PersonDetection`` list /
+``SegmentationFrame``) on ``NoveltyTopics`` for ``DeliveryNode`` to consume,
+then drawing the identical overlay from that already-computed result (no
+second inference call). ``CameraManager`` needs the shared ``MessageBus``
+for this - see its own ``bus`` constructor parameter.
 """
 from __future__ import annotations
 
@@ -24,9 +37,12 @@ import io
 import os
 import threading
 import time
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 from drone_stack.utils.logging_setup import get_logger
+
+if TYPE_CHECKING:
+    from drone_stack.bus import MessageBus
 
 _log = get_logger("gcs.cameras")
 
@@ -365,58 +381,135 @@ class PiCamera(_BaseCamera):
 
 
 # --------------------------------------------------------------------------- #
-# Hailo overlay wiring
+# Novelty layer overlay wiring - see module docstring "Novelty layer tap"
 # --------------------------------------------------------------------------- #
-_MODELS_DIR = os.environ.get(
-    "HAILO_MODELS_DIR",
-    os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "models"),
-)
+def _draw_person_detections(frame_bgr, detections: list) -> "object":
+    """Draw PERSON boxes from an already-computed detection list - mirrors
+    ``hailo_infer.Detector.draw()`` exactly (same colours/label), operating
+    on ``PersonDetection`` objects instead of raw tuples since that is what
+    the novelty registry's ``DetectorAdapter`` returns."""
+    import cv2
+
+    for d in detections:
+        x1, y1, x2, y2 = d.bbox.x1, d.bbox.y1, d.bbox.x2, d.bbox.y2
+        cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), (0, 235, 255), 2)
+        tag = f"PERSON {d.score * 100:.0f}%"
+        (tw, th), _ = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        cv2.rectangle(frame_bgr, (x1, y1 - th - 6), (x1 + tw + 4, y1), (0, 235, 255), -1)
+        cv2.putText(frame_bgr, tag, (x1 + 2, y1 - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+    return frame_bgr
 
 
-def _build_hailo_processors():
-    """Return (usb_processor, picam_processor).
+def _draw_terrain_segmentation(frame_bgr, segmentation, safe_classes: set) -> "object":
+    """Draw a translucent tint + contour over "safe" terrain cells - mirrors
+    ``hailo_infer.Segmenter.process()``'s overlay exactly, but reads an
+    already-computed multi-class ``SegmentationFrame`` instead of a boolean
+    mask. A pixel counts as "safe" for the tint iff its class is in
+    *safe_classes* - the caller passes every ``TerrainClass`` with
+    ``surface_suitability > 0`` in ``landing_zone.yaml``, so the overlay
+    always shows exactly what §2.1's own scorer would consider a candidate
+    surface, not a separately-maintained definition of "safe"."""
+    import cv2
+    import numpy as np
 
-    usb   -> terrain segmentation overlay,
-    picam -> yolov8n person-detection overlay.
+    class_map = segmentation.class_indices  # (h, w) int8, MODEL resolution
+    safe_ids = [i for i, c in segmentation.index_to_class.items() if c in safe_classes]
+    mask = np.isin(class_map, safe_ids) if safe_ids else np.zeros_like(class_map, dtype=bool)
+    fh, fw = frame_bgr.shape[:2]
+    mask_u8 = cv2.resize(mask.astype(np.uint8), (fw, fh), interpolation=cv2.INTER_NEAREST)
+    mask_full = mask_u8.astype(bool)
+    overlay = frame_bgr.copy()
+    overlay[mask_full] = (0, 200, 60)  # BGR
+    cv2.addWeighted(overlay, 0.30, frame_bgr, 0.70, 0, frame_bgr)
+    contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(frame_bgr, contours, -1, (0, 255, 120), 2)
+    cv2.putText(frame_bgr, "TERRAIN", (8, fh - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 120), 2, cv2.LINE_AA)
+    return frame_bgr
 
-    Returns (None, None) if the Hailo stack / models are unavailable so the
-    cameras fall back to raw video with no error.
+
+def _build_novelty_processors(bus: Optional["MessageBus"]):
+    """Return (usb_processor, picam_processor) built from the novelty
+    ``ModelRegistry`` - see the module docstring's "Novelty layer tap".
+
+    usb   -> terrain segmentation: publishes ``SegmentationFrame`` on
+             ``NoveltyTopics.TERRAIN_MAP``, then the same tint+contour overlay.
+    picam -> yolov8n person detection: publishes ``list[PersonDetection]``
+             (ground-projection is ``DeliveryNode``'s job, not this one - see
+             its own module docstring) on ``NoveltyTopics.PERSON_DETECTIONS``,
+             then the same box+label overlay.
+
+    Returns (None, None) if the novelty config, registry, or Hailo stack is
+    unavailable so the cameras fall back to raw video with no error -
+    matches the pre-existing graceful-degradation contract. If *bus* is
+    None (no shared MessageBus available), the overlay still draws but
+    nothing is published - a camera-only caller with no bus still works.
     """
     try:
-        from drone_stack.gcs.hailo_infer import Detector, Segmenter
+        from drone_stack.novelty.config import NoveltyConfig
+        from drone_stack.novelty.perception.model_registry import ModelRegistry
+        from drone_stack.novelty.topics import NoveltyTopics
     except Exception as exc:  # noqa: BLE001
-        _log.warning("Hailo overlays disabled (import failed: %s)", exc)
+        _log.warning("novelty overlays disabled (import failed: %s)", exc)
         return None, None
 
-    terrain = os.path.join(_MODELS_DIR, "terrain.hef")
-    yolo = os.path.join(_MODELS_DIR, "yolov8n.hef")
+    try:
+        cfg = NoveltyConfig.load()
+        registry = ModelRegistry.from_config(cfg.models)
+    except Exception as exc:  # noqa: BLE001 - see perception/adapters.py's own
+        # docstring: a busy/absent Hailo device can raise OUTSIDE the
+        # adapters' own graceful-degradation boundary, so this construction
+        # is wrapped here exactly like DeliveryNode wraps its own registry.
+        _log.warning("novelty overlays disabled (config/registry failed: %s)", exc)
+        return None, None
+
+    safe_classes = {c for c, score in cfg.landing_zone.surface_suitability.items() if score > 0}
+
     usb_proc = picam_proc = None
-    try:
-        seg = Segmenter(terrain)
-        if seg.ok:
-            usb_proc = seg.process
-            _log.info("USB webcam: terrain segmentation overlay ENABLED (Hailo)")
-    except Exception as exc:  # noqa: BLE001
-        _log.warning("terrain segmenter init failed: %s", exc)
-    try:
-        det = Detector(yolo, score_thr=0.40)
-        if det.ok:
-            picam_proc = det.process
-            _log.info("Pi camera: yolov8n person-detection overlay ENABLED (Hailo)")
-    except Exception as exc:  # noqa: BLE001
-        _log.warning("yolov8n detector init failed: %s", exc)
+
+    if "terrain" in registry.names() and registry.get("terrain").ok:
+        terrain_model = registry.get("terrain")
+
+        def usb_proc(frame_bgr, _model=terrain_model, _safe=safe_classes):
+            out = _model.infer(frame_bgr)
+            if out.segmentation is None:
+                return frame_bgr
+            if bus is not None:
+                bus.publish(NoveltyTopics.TERRAIN_MAP, out.segmentation)
+            return _draw_terrain_segmentation(frame_bgr, out.segmentation, _safe)
+
+        _log.info("USB webcam: terrain segmentation overlay ENABLED (novelty registry)")
+
+    if "yolov8n" in registry.names() and registry.get("yolov8n").ok:
+        person_model = registry.get("yolov8n")
+
+        def picam_proc(frame_bgr, _model=person_model):
+            out = _model.infer(frame_bgr)
+            if bus is not None:
+                bus.publish(NoveltyTopics.PERSON_DETECTIONS, out.detections)
+            return _draw_person_detections(frame_bgr, out.detections)
+
+        _log.info("Pi camera: yolov8n person-detection overlay ENABLED (novelty registry)")
+
     return usb_proc, picam_proc
 
 
 class CameraManager:
     """Owns both cameras; lazy-starts capture on first access."""
 
-    def __init__(self) -> None:
+    def __init__(self, bus: Optional["MessageBus"] = None) -> None:
+        # *bus* is the shared MessageBus (GcsHub.bus) the novelty-layer
+        # overlay processors publish structured detections/segmentation on
+        # - see _build_novelty_processors. Optional so a caller with no bus
+        # (e.g. a camera-only script) still gets working overlays, just
+        # without the NoveltyTopics publish side effect.
+        self._bus = bus
         # NOTE: the USB C270 is capped at 640x480. At 1280x720 its USB power +
         # bandwidth draw starves the RPLIDAR C1 (shared USB bus), stalling the
         # LIDAR motor. 640x480 lets both run - LIDAR holds a full 10 Hz. The Pi
         # camera is on CSI (not USB), so it keeps 1280x720 without contention.
-        usb_proc, picam_proc = _build_hailo_processors()
+        usb_proc, picam_proc = _build_novelty_processors(bus)
         self._cams: dict[int, _BaseCamera] = {
             0: UsbCamera(0, index=0, name="USB", width=640, height=480, skip=1,
                          processor=usb_proc),

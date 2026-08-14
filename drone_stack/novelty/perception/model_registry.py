@@ -107,7 +107,11 @@ class ModelRegistry:
     def from_config(cls, config: ModelsConfig) -> "ModelRegistry":
         # Imported here (not at module scope) so a pure-algorithm test suite
         # that only needs the registry API never has to import hailo_infer.
-        from drone_stack.novelty.perception.adapters import DetectorAdapter, SegmenterAdapter
+        from drone_stack.novelty.perception.adapters import (
+            DetectorAdapter,
+            MultiClassSegmenterAdapter,
+            SegmenterAdapter,
+        )
 
         models: dict[str, VisionModel] = {}
         for name, spec in config.models.items():
@@ -120,6 +124,14 @@ class ModelRegistry:
                     input_shape=spec.input_shape,
                     score_thr=spec.score_thr or 0.25,
                     version=version,
+                )
+            elif spec.kind == "segmenter" and spec.class_map is not None:
+                models[name] = MultiClassSegmenterAdapter(
+                    hef_path=hef_path,
+                    name=name,
+                    input_shape=spec.input_shape,
+                    version=version,
+                    class_map=spec.class_map,
                 )
             elif spec.kind == "segmenter":
                 assert spec.binary_fallback is not None  # enforced by ModelSpecConfig

@@ -50,6 +50,8 @@ MISSION_FSM = {
     "search_radius_expansion_m": 5.0,
     "max_search_radius_m": 30.0,
     "max_hover_retries": 1,
+    "descent_hover_altitude_m": 2.0,
+    "ascend_target_altitude_m": 8.0,
 }
 
 MOTION_MONITOR = {
@@ -58,6 +60,7 @@ MOTION_MONITOR = {
     "zone_intrusion_radius_m": 3.0,
     "track_history_len": 5,
     "min_track_frames": 3,
+    "max_association_distance_m": 2.0,
 }
 
 MODELS = {

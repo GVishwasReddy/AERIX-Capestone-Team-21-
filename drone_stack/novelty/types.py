@@ -197,6 +197,52 @@ class AuthDecision:
     stamp: float = field(default_factory=time.time)
 
 
+@dataclass
+class DisambiguationScore:
+    """One person candidate's full score breakdown from one §2.5
+    disambiguation pass - kept even for losing candidates so the caller can
+    log the complete scoring table (patent evidence), not just the winner."""
+
+    track_id: int | None
+    ground: GroundPoint
+    position_score: float
+    rssi_consistency_score: float
+    motion_cue_score: float
+    likelihood: float
+
+
+@dataclass
+class DisambiguationResult:
+    """Outcome of one §2.5 multi-person disambiguation pass.
+
+    ``winner`` is ``None`` whenever the top candidate does not beat the
+    runner-up by at least ``disambiguation_margin`` (or there were no
+    candidates at all) - the mission FSM reads that as "still ambiguous",
+    not as an error, and re-observes rather than committing to a guess.
+    ``scores`` is every candidate, sorted descending by ``likelihood``.
+    """
+
+    winner: PersonDetection | None
+    scores: list[DisambiguationScore]
+    reason: str  # "no_candidates" | "unambiguous_single_candidate" | "margin_met" | "margin_not_met"
+
+
+# --------------------------------------------------------------------------- #
+# §2.3 mission FSM
+# --------------------------------------------------------------------------- #
+@dataclass
+class FsmStateSnapshot:
+    """Published on ``NoveltyTopics.MISSION_FSM_STATE`` every
+    ``DeliveryNode`` step - lets the GCS (and a live observer) see the
+    mission's current phase without replaying the JSON-Lines flight log."""
+
+    state: str
+    elapsed_in_state_s: float
+    recipient_track_id: int | None = None
+    search_radius_m: float = 0.0
+    stamp: float = field(default_factory=time.time)
+
+
 # --------------------------------------------------------------------------- #
 # Descent safety (§2.4)
 # --------------------------------------------------------------------------- #

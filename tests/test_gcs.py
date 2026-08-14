@@ -79,3 +79,46 @@ def test_unknown_command():
     r = hub.command("does_not_exist")
     assert not r["ok"]
     assert "unknown command" in r["message"]
+
+
+@pytest.mark.timeout(20)
+def test_ble_auth_event_publishes_onto_the_novelty_bus():
+    """The BLE peripheral (drone_ble_peripheral.py) is a separate process
+    that bridges here over POST /api/command - see hub.py's own
+    _on_ble_auth_event docstring for why BLE carries no release power."""
+    from drone_stack.novelty.topics import NoveltyTopics
+    from drone_stack.novelty.types import BleAuthEvent
+
+    hub = GcsHub(Config.load())
+    r = hub.command("ble_auth_event", {"authenticated": True, "phone_gps": [12.34, 56.78]})
+    assert r["ok"], r
+
+    event = hub.bus.latest(NoveltyTopics.BLE_AUTH_EVENT)
+    assert isinstance(event, BleAuthEvent)
+    assert event.authenticated is True
+    assert event.phone_gps == (12.34, 56.78)
+    assert event.rssi_dbm is None
+
+
+@pytest.mark.timeout(20)
+def test_ble_auth_event_without_phone_gps_carries_rssi_only():
+    from drone_stack.novelty.topics import NoveltyTopics
+
+    hub = GcsHub(Config.load())
+    hub.command("ble_auth_event", {"authenticated": False, "rssi_dbm": -70.0})
+
+    event = hub.bus.latest(NoveltyTopics.BLE_AUTH_EVENT)
+    assert event.authenticated is False
+    assert event.phone_gps is None
+    assert event.rssi_dbm == -70.0
+
+
+@pytest.mark.timeout(20)
+def test_ble_auth_event_defaults_to_unauthenticated_when_missing():
+    from drone_stack.novelty.topics import NoveltyTopics
+
+    hub = GcsHub(Config.load())
+    hub.command("ble_auth_event", {})
+
+    event = hub.bus.latest(NoveltyTopics.BLE_AUTH_EVENT)
+    assert event.authenticated is False

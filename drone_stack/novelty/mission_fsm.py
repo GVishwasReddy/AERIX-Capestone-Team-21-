@@ -1,14 +1,17 @@
 """§2.3 - the delivery-attempt mission state machine.
 
-SCAFFOLD NOTE: this module currently declares the state/event/transition
-*data* only (states, typed events, the transition table, and the guard
-predicates it references). The execution engine (``MissionFSM.advance``)
-is implemented in a later pass once ``landing_zone``, ``recipient_auth``
-and ``motion_monitor`` exist to produce the events it consumes - see the
-project plan, step 5. Declaring the table now, ahead of the engine, is
-deliberate: the table is reviewed/tested as pure data (every transition's
-endpoints are valid states, every non-terminal state has a configured
-timeout) independent of the engine that will walk it.
+The state/event/transition *data* (states, typed events, the transition
+table, and the guard predicates it references) is declared first, ahead of
+the ``MissionFSM`` engine that walks it, deliberately: the table is
+reviewed/tested as pure data (every transition's endpoints are valid
+states, every non-terminal state has a configured timeout) independent of
+the engine. ``MissionFSM`` itself (bottom of this file) is a thin,
+generic walker - ``advance(event)`` looks up the current state's row for
+``type(event)``, checks its guard against ``ctx``, and moves ``self.state``
+if it matches; ``check_timeout()`` is the same lookup keyed on elapsed time
+instead of an event. All of the actual perception/decision logic (running
+landing_zone/recipient_auth/motion_monitor, deciding which ``Event`` to
+raise) lives in ``delivery_node.py``, not here - see its module docstring.
 
 State chain (happy path):
 
@@ -39,9 +42,23 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
-from drone_stack.novelty.types import AuthDecision, MotionAbortEvent, ZoneCandidate, PersonDetection
+from drone_stack.novelty.evidence_logger import EvidenceLogger
+from drone_stack.novelty.types import (
+    AuthDecision,
+    MotionAbortEvent,
+    PersonDetection,
+    ZoneCandidate,
+    to_jsonable,
+)
+
+if TYPE_CHECKING:
+    # Deferred: config.py imports MissionState/TIMED_STATES from this module
+    # for its own validator, so an unconditional top-level import here would
+    # be circular - see config.py's own "avoid a config.py <-> mission_fsm.py
+    # import cycle" comment.
+    from drone_stack.novelty.config import MissionFsmConfig
 
 
 class MissionState(str, Enum):
@@ -321,17 +338,91 @@ validate_table()
 
 
 class MissionFSM:
-    """Event-driven engine over TRANSITIONS.
+    """Event-driven engine over TRANSITIONS - the walker for the table
+    declared above.
 
-    SCAFFOLD: constructor only. ``advance()`` is implemented once
-    ``delivery_node.py`` exists to supply events and an
-    :class:`~drone_stack.novelty.evidence_logger.EvidenceLogger` - see the
-    project plan, step 5.
+    ``ctx`` is a plain mutable dict the caller (``delivery_node.py``) both
+    reads (guards - see ``has_confirmed_person`` etc. above) and writes
+    (e.g. ``recipient_track_id``, ``search_radius_m``) as the mission
+    progresses - kept as a dict rather than a typed dataclass so the guard
+    callables stay simple and uniform instead of needing a per-field
+    accessor each.
     """
 
-    def __init__(self, config, logger, ctx: dict | None = None) -> None:
+    def __init__(
+        self,
+        config: "MissionFsmConfig",
+        logger: EvidenceLogger | None,
+        ctx: dict | None = None,
+    ) -> None:
         self.config = config
         self.logger = logger
         self.state = MissionState.SEARCHING_PERSON
         self.ctx: dict = ctx if ctx is not None else {}
         self._state_entered_at = time.time()
+
+    def reset(self) -> None:
+        """Return to the initial state with a fresh entry timestamp - call
+        when starting a new delivery attempt. Does NOT clear ``ctx``; the
+        caller owns what (if anything) should carry over."""
+        self.state = MissionState.SEARCHING_PERSON
+        self._state_entered_at = time.time()
+
+    def elapsed_in_state(self, now: float | None = None) -> float:
+        now = now if now is not None else time.time()
+        return now - self._state_entered_at
+
+    def timeout_s(self, state: MissionState | None = None) -> float | None:
+        """The configured timeout for *state* (default: the current state),
+        or ``None`` for a terminal state (never times out)."""
+        state = state if state is not None else self.state
+        if state in TERMINAL_STATES:
+            return None
+        return self.config.state_timeout_s[state.value]
+
+    def check_timeout(self, now: float | None = None) -> bool:
+        """If the current state's configured timeout has elapsed, fire a
+        ``TimeoutEvent`` (advancing the FSM per TRANSITIONS) and return
+        ``True``. A no-op returning ``False`` for a terminal state or if the
+        timeout has not yet elapsed. Call once per step whenever no domain
+        event fired this tick - see ``delivery_node.py``."""
+        timeout = self.timeout_s()
+        if timeout is None:
+            return False
+        now = now if now is not None else time.time()
+        if self.elapsed_in_state(now) < timeout:
+            return False
+        return self.advance(TimeoutEvent(stamp=now, state=self.state))
+
+    def advance(self, event: Event) -> bool:
+        """Apply *event* to the current state via TRANSITIONS. Returns
+        ``True`` and updates ``self.state`` if a matching, guard-passing row
+        was found for ``type(event)``; otherwise a no-op returning
+        ``False`` - an event with no matching row for the current state is
+        simply not a valid transition right now, not an error (e.g. a stray
+        ``PersonDetectedEvent`` while already ``DESCENDING``)."""
+        if self.state in TERMINAL_STATES:
+            return False
+        from_state = self.state
+        for t in transitions_from(from_state):
+            if t.event_type is not type(event):
+                continue
+            if t.guard is not None and not t.guard(self.ctx):
+                continue
+            self.state = t.to_state
+            self._state_entered_at = event.stamp
+            self._log_transition(from_state, t, event)
+            return True
+        return False
+
+    def _log_transition(self, from_state: MissionState, t: Transition, event: Event) -> None:
+        if self.logger is None:
+            return
+        self.logger.log_event(
+            event_name="fsm_transition",
+            mission_state=from_state.value,
+            inputs=to_jsonable(event),
+            computed_values={"to_state": t.to_state.value, "description": t.description},
+            threshold=self.timeout_s(from_state),
+            decision=f"{from_state.value} -> {t.to_state.value}",
+        )

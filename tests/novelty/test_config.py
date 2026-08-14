@@ -99,3 +99,79 @@ def test_segmenter_without_binary_fallback_fails_loud(tmp_path):
     write_config_dir(tmp_path, overrides={"models.yaml": models})
     with pytest.raises(NoveltyConfigError, match="models.yaml"):
         NoveltyConfig.load(tmp_path)
+
+
+_CLASS_MAP_7 = ["grass", "pavement", "dirt", "water", "vegetation", "obstacle", "unknown"]
+
+
+def test_segmenter_with_class_map_loads_without_binary_fallback(tmp_path):
+    """A genuinely multi-class model (e.g. fabseg.hef) sets class_map instead
+    of binary_fallback/seg_threshold - argmax has no sigmoid threshold."""
+    from tests.novelty.conftest import MODELS
+
+    models = copy.deepcopy(MODELS)
+    del models["models"]["terrain"]["binary_fallback"]
+    del models["models"]["terrain"]["seg_threshold"]
+    models["models"]["terrain"]["class_map"] = list(_CLASS_MAP_7)
+    write_config_dir(tmp_path, overrides={"models.yaml": models})
+
+    cfg = NoveltyConfig.load(tmp_path)
+    terrain = cfg.models.models["terrain"]
+    assert [c.value for c in terrain.class_map] == _CLASS_MAP_7
+    assert terrain.binary_fallback is None
+    assert terrain.seg_threshold is None
+
+
+def test_segmenter_without_binary_fallback_or_class_map_fails_loud(tmp_path):
+    from tests.novelty.conftest import MODELS
+
+    models = copy.deepcopy(MODELS)
+    del models["models"]["terrain"]["binary_fallback"]
+    del models["models"]["terrain"]["seg_threshold"]
+    write_config_dir(tmp_path, overrides={"models.yaml": models})
+    with pytest.raises(NoveltyConfigError, match="models.yaml"):
+        NoveltyConfig.load(tmp_path)
+
+
+def test_segmenter_with_both_binary_fallback_and_class_map_fails_loud(tmp_path):
+    from tests.novelty.conftest import MODELS
+
+    models = copy.deepcopy(MODELS)
+    models["models"]["terrain"]["class_map"] = list(_CLASS_MAP_7)
+    write_config_dir(tmp_path, overrides={"models.yaml": models})
+    with pytest.raises(NoveltyConfigError, match="models.yaml"):
+        NoveltyConfig.load(tmp_path)
+
+
+def test_segmenter_with_class_map_and_seg_threshold_fails_loud(tmp_path):
+    """seg_threshold is a sigmoid-threshold concept; argmax models must not set it."""
+    from tests.novelty.conftest import MODELS
+
+    models = copy.deepcopy(MODELS)
+    del models["models"]["terrain"]["binary_fallback"]
+    models["models"]["terrain"]["class_map"] = list(_CLASS_MAP_7)
+    write_config_dir(tmp_path, overrides={"models.yaml": models})
+    with pytest.raises(NoveltyConfigError, match="models.yaml"):
+        NoveltyConfig.load(tmp_path)
+
+
+def test_segmenter_with_single_entry_class_map_fails_loud(tmp_path):
+    from tests.novelty.conftest import MODELS
+
+    models = copy.deepcopy(MODELS)
+    del models["models"]["terrain"]["binary_fallback"]
+    del models["models"]["terrain"]["seg_threshold"]
+    models["models"]["terrain"]["class_map"] = ["grass"]
+    write_config_dir(tmp_path, overrides={"models.yaml": models})
+    with pytest.raises(NoveltyConfigError, match="models.yaml"):
+        NoveltyConfig.load(tmp_path)
+
+
+def test_detector_with_segmenter_only_field_fails_loud(tmp_path):
+    from tests.novelty.conftest import MODELS
+
+    models = copy.deepcopy(MODELS)
+    models["models"]["yolov8n"]["seg_threshold"] = 0.5
+    write_config_dir(tmp_path, overrides={"models.yaml": models})
+    with pytest.raises(NoveltyConfigError, match="models.yaml"):
+        NoveltyConfig.load(tmp_path)

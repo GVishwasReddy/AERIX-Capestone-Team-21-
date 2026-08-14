@@ -30,3 +30,12 @@ track_history_len: 5
 # (fewer than this -> no abort decision from motion yet, avoids acting on
 # a single noisy detection).
 min_track_frames: 3
+
+# Frame-to-frame tracking gate: a new detection is matched to an existing
+# track only if it falls within this many metres of that track's last
+# known ground position; otherwise it starts a new track. GUESSED - loose
+# enough to survive an occasional dropped frame at typical webcam frame
+# rates without merging two different people who are each other's
+# nearest match (recipient_auth.yaml's r_min_m=2.0 suggests people are not
+# expected closer together than that in a handoff scene).
+max_association_distance_m: 2.0

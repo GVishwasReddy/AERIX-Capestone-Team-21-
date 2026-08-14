@@ -77,6 +77,16 @@ def build_supervisor(
     if config.get("diagnostics.enabled", True):
         supervisor.add(lambda: DiagnosticsNode(bus, config))
 
+    if config.get("novelty.enabled", False):
+        # Lazily imported (unlike every node above) so a deployment that
+        # never enables the novelty layer pays no import cost for its extra
+        # dependencies (pydantic, numpy-backed perception types) - matches
+        # the "additive, optional, off by default" design in the project
+        # plan. See drone_stack/novelty/delivery_node.py's own docstring.
+        from drone_stack.novelty.delivery_node import DeliveryNode
+
+        supervisor.add(lambda: DeliveryNode(bus, config))
+
     if include_web and config.get("web.enabled", True):
         supervisor.add(lambda: WebDashboard(bus, config, services))
 
