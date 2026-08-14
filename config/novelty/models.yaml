@@ -5,10 +5,18 @@
 # abstraction, not in this file). hef_path is repo-root-relative.
 #
 # terrain: fabseg.hef - a real, retrained multi-class terrain-segmentation
-# model (7 classes, channel order confirmed to match TerrainClass's own
-# declared enum order exactly - grass, pavement, dirt, water, vegetation,
-# obstacle, unknown). Delivered 2026-08-14; supersedes the old binary
-# terrain.hef placeholder (kept on disk on the Pi, no longer referenced here).
+# model. Delivered 2026-08-14; supersedes the old binary terrain.hef
+# placeholder (kept on disk on the Pi, no longer referenced here).
+#
+# CORRECTED 2026-08-14 (same day, after real-hardware verification on the
+# Pi): the model's real output is 8 channels, not 7 - it was NOT trained on
+# TerrainClass's own vocabulary. It uses the source landing_seg capstone's
+# own 8-class taxonomy (background, safe_ground, paved, water, vegetation,
+# structure, vehicle, person - see that project's own labelmap.py). The
+# class_map below maps each of those 8 raw channels onto the closest
+# TerrainClass value (argmax runs over all 8 real channels first, so no
+# discriminating information is lost by two channels sharing a target
+# class - only the WINNING channel's target is used per pixel).
 #
 # yolov8n: still the CURRENT placeholder weights already on the Pi
 # (models/yolov8n.hef - see CLAUDE.md §10) - the retrained person-detection
@@ -40,24 +48,24 @@ models:
     # (h, w, c) - GUESSED. This field is DOCUMENTATION only: the real input
     # tensor shape is queried from the .hef itself via HailoRT at load time
     # (drone_stack/gcs/hailo_infer.py's _Model.__init__ -> im.input().shape),
-    # never read from here, so a wrong guess cannot break inference - but it
-    # should still be corrected to the true value once fabseg.hef is loaded
-    # on the Pi's Hailo-8 and the real shape is logged at startup.
-    input_shape: [384, 640, 3]
-    # No seg_threshold - fabseg.hef is a genuine 7-class model, argmax over
-    # channels has no threshold. class_map is the .hef's own output-channel
-    # order, index-for-index (confirmed with the model provider 2026-08-14):
-    # channel 0 = grass, 1 = pavement, ... matching TerrainClass's own
-    # declared enum order exactly, so no separate index<->class table was
-    # needed beyond listing it here.
+    # never read from here, so a wrong guess cannot break inference. Updated
+    # 2026-08-14 to 640x640 (the real OUTPUT resolution observed on hardware
+    # - a reasonable proxy for input resolution, still unconfirmed exactly).
+    input_shape: [640, 640, 3]
+    # No seg_threshold - fabseg.hef argmaxes over 8 real channels, no
+    # threshold applies. class_map is the .hef's own output-channel order,
+    # index-for-index, mapped onto the closest TerrainClass value - see the
+    # header comment above for the real (landing_seg) taxonomy each line
+    # corresponds to and why person/structure/vehicle collapse onto OBSTACLE.
     class_map:
-      - grass
-      - pavement
-      - dirt
-      - water
-      - vegetation
-      - obstacle
-      - unknown
+      - unknown    # channel 0: background
+      - grass      # channel 1: safe_ground
+      - pavement   # channel 2: paved
+      - water      # channel 3: water
+      - vegetation # channel 4: vegetation
+      - obstacle   # channel 5: structure
+      - obstacle   # channel 6: vehicle
+      - obstacle   # channel 7: person - never treat a person-occupied pixel as landable
 
   yolov8n:
     kind: detector

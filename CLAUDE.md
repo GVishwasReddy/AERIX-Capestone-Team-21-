@@ -291,3 +291,110 @@ person), so this is a *model quality* limit, not a pipeline bug. Consequences:
 - **2026-08-10 (later)** — Hailo NPU overlays on both camera feeds (terrain seg
   on USB, yolov8n person detect on Pi cam); decoupled USB capture + manual
   exposure; Pi cam 30 fps. See §10. Backups in `.claude_backup_20260810_214900`.
+
+---
+
+## 11. AERIX Novelty Layer — autonomous markerless delivery (added 2026-08-14)
+
+A new, **optional, additive** package `drone_stack/novelty/` sitting ABOVE the
+flight stack in this file's §1-§10 — it never touches PX4 params, the MAVLink
+interface, avoidance, or RTL logic directly. Off by default
+(`config/default.yaml`'s `novelty.enabled: false`); `launch/bringup.py` only
+constructs its one node (`DeliveryNode`) when that flag is true. Built and
+tested on the Mac mirror first (per standing instruction), pushed and
+committed here 2026-08-14 (`git log` — commit `297b1f7`).
+
+**What it adds** (patent-oriented, one doc per module in `docs/novelty/*.md`,
+one YAML per module in `config/novelty/*.yaml`, every threshold `# GUESSED`
+pending real flight data):
+- `landing_zone.py` (§2.1) — markerless zone scoring from terrain
+  segmentation (surface suitability, slope, clutter, contiguous safe area).
+- `recipient_auth.py` (§2.2/§2.5) — dual-factor BLE+vision release gating
+  (six branches) and multi-person disambiguation (α/β/γ weighted score +
+  margin rule). BLE's own position estimate is fused: phone GPS preferred,
+  RSSI log-distance range as a coarser fallback.
+- `motion_monitor.py` (§2.4) — descent-abort on recipient velocity (AND
+  low-altitude) or a third party entering the landing zone.
+- `mission_fsm.py` — a declarative state/transition table (patent Figure
+  material) plus a small generic engine (`MissionFSM.advance`/
+  `check_timeout`) that walks it.
+- `delivery_node.py` — the ONE bus-facing node. Ground-projects raw
+  `PersonDetection`s, sequences the modules above through the FSM, and
+  issues `NavCommand`s exactly like `NavigationNode` already does
+  (`hold`/`rtl` on `Topics.MISSION_CMD`, `goto`/`set_servo` on
+  `Topics.MAVLINK_CMD`) — it pulls `NavigationNode` out of its own mission
+  with `hold` before commanding descent directly, and hands off to
+  `NavigationNode`'s own `rtl` service on `RTL`/`ABORT_RTL` rather than
+  duplicating that lifecycle.
+- **BLE re-gated**: `ble_handshake/drone_ble_peripheral.py` no longer drives
+  the payload servo itself — a confirmed drop (HMAC-verified, as before) now
+  POSTs to this same process's existing `/api/command` HTTP API
+  (`cmd: ble_auth_event`), which `gcs/hub.py`'s new `_on_ble_auth_event`
+  bridges onto the novelty bus for `DualFactorAuthenticator` to read
+  alongside the INDEPENDENT vision channel — a spoofed/wrong-person BLE
+  handshake can no longer release anything on its own. Also added a
+  GPS-write BLE characteristic (16 bytes, 2× float64 LE) and fixed a
+  staleness gap (publishes `authenticated=false` when the anti-replay nonce
+  refreshes, so a disconnected phone's old "authenticated" state doesn't sit
+  latched on the bus forever).
+- **Camera tap**: `gcs/cameras.py`'s `_build_novelty_processors` replaces the
+  old `_build_hailo_processors` — inference still runs exactly once per kept
+  frame, but now via the novelty `ModelRegistry` (not raw `Detector`/
+  `Segmenter` construction), publishing structured results
+  (`PersonDetection` list / `SegmentationFrame`) on `NoveltyTopics` before
+  drawing the identical overlay from that already-computed result.
+  `CameraManager` now takes an optional `bus` param; `GcsHub` passes its own.
+
+**Model**: `models/fabseg.hef` (already on this Pi, `models/` dir, sha256
+`1993cde...`) is wired in as the real multi-class terrain model, replacing
+the old binary `terrain.hef` for the novelty-layer overlay/scoring path
+(`terrain.hef` itself is untouched, still on disk, no longer referenced by
+`config/novelty/models.yaml`). **`yolov8n.hef` retrain still pending** —
+person detection keeps using the current weak/placeholder weights already
+documented in §10's "Model choice & the weak-model caveat".
+
+### ⚠️ fabseg.hef's real class taxonomy (corrected 2026-08-14, same day)
+
+Initially wired assuming a 7-class output matching `TerrainClass` exactly.
+**Wrong** — verified on THIS Pi's real Hailo-8 after the service restart: the
+model's real output is **8 channels**
+(`MultiClassSegmenter(terrain): output shape (640, 640, 8)`), matching the
+source landing_seg capstone's own 8-class training taxonomy (background,
+safe_ground, paved, water, vegetation, structure, vehicle, person — see that
+project's `labelmap.py`), not `TerrainClass`'s 7 values. Fixed in
+`config/novelty/models.yaml`'s `class_map` (8 entries now, channel-commented,
+`structure`/`vehicle`/`person` all collapse onto `TerrainClass.OBSTACLE` —
+argmax runs over all 8 real channels first, so no discriminating information
+is lost by three channels sharing one target class). **This is the kind of
+bug that ONLY shows up against real hardware** — 190/190 tests were green on
+both the Mac and this Pi before this was caught, because no test fed a real
+8-channel Hailo output through the adapter; they all used synthetic
+7-channel data matching the (wrong) assumption. Lesson for next time: get
+real model output shape from actual hardware inference BEFORE writing the
+class_map, not just from the model provider's stated class count.
+
+### Known limitations (see docs/novelty/*.md for the full list per module)
+- All `# GUESSED` thresholds across the five `config/novelty/*.yaml` files
+  need real flight/bench data.
+- `RELEASING`'s servo-release confirmation is a fixed 1.0s timer, not a real
+  `SERVO_OUTPUT_RAW` readback (not on any bus topic yet).
+- BLE peripheral changes are code-reviewed but were never integration-tested
+  against real BlueZ/D-Bus (not installable on the Mac dev machine) until
+  this process actually runs on hardware with a real phone.
+- `fabseg.hef`'s NHWC-vs-NCHW output-layout defensive check in
+  `MultiClassSegmenter.infer_class_map` is still unverified either way in
+  the sense that only ONE layout has actually been exercised on real
+  hardware so far (whichever this Pi's HailoRT export used) — the OTHER
+  branch remains defensive-but-unexercised code.
+
+### Changelog
+- **2026-08-14** — AERIX novelty layer (Steps 2-6 of the implementation
+  plan) built and tested on the Mac mirror, pushed here via `scp`, committed
+  (`297b1f7`), 190/190 tests green on this Pi's real hardware (including the
+  real `HAILO_OUT_OF_PHYSICAL_DEVICES` degradation path, since
+  `aerix-gcs.service` already holds the one physical Hailo-8 — a bug in
+  `tests/novelty/test_adapters.py`'s own test fixtures only surfaced here,
+  fixed same day). Service restarted to load it (`novelty.enabled` stayed
+  `false`, so no behavioral change from the restart itself). Real-hardware
+  verification then caught `fabseg.hef`'s true 8-channel output (see the
+  ⚠️ note above) — `config/novelty/models.yaml` corrected same day.
