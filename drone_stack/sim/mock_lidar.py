@@ -3,7 +3,14 @@
 Ray-casts the shared :class:`~drone_stack.sim.world.SimWorld` once per beam to
 produce a :class:`~drone_stack.msg.LaserScan` in exactly the same layout the real
 driver emits (360 beams, angle 0 = forward), so downstream nodes cannot tell the
-difference between simulation and hardware.
+difference between simulation and hardware - including the front-referenced
+(There is no ``clockwise`` handedness conversion here: the mock generates its
+beams directly in the stack's counter-clockwise frame, so there is nothing to
+convert. That flag is a property of the physical device only.)
+
+difference between simulation and hardware - including the front-referenced
+:class:`~drone_stack.interfaces.lidar_interface.FovMask`, so the rear 90 deg is
+just as blind in sim as it is on the aircraft.
 """
 from __future__ import annotations
 
@@ -13,6 +20,7 @@ from typing import Any
 
 from drone_stack.interfaces.lidar_interface import (
     DEFAULT_BINS,
+    FovMask,
     LidarInterface,
     build_empty_ranges,
 )
@@ -34,6 +42,8 @@ class MockLidar(LidarInterface):
         self._invert = bool(config.get("invert", False))
         self._noise_m = 0.02
         self._bins = DEFAULT_BINS
+        # Same 270 deg window the real driver applies.
+        self._fov = FovMask(config)
         self._connected = False
 
     @property
@@ -55,7 +65,10 @@ class MockLidar(LidarInterface):
         ranges = build_empty_ranges(self._bins)
         intensities = [0.0] * self._bins
         yaw = self._world.state.yaw
+        keep = self._fov.keep_bins(self._bins)
         for i in range(self._bins):
+            if not keep[i]:
+                continue          # rear blind sector - not scanned at all
             sensor_angle = i * inc + self._offset
             if self._invert:
                 sensor_angle = -sensor_angle

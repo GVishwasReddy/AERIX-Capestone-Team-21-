@@ -25,6 +25,7 @@ from drone_stack.msg import (
     LinkQuality,
     Message,
     NavCommand,
+    FcMessage,
     RcChannels,
     SystemStatus,
     Velocity,
@@ -82,6 +83,12 @@ class RealMavlink(MavlinkInterface):
         self._target_component: int = int(config.get("target_component", 1))
         self._stream_rate: int = int(config.get("request_stream_rate_hz", 10))
         self._hb_timeout: float = float(config.get("heartbeat_timeout_s", 5.0))
+        # Hard altitude ceiling, mirrored here from safety.max_altitude_m by
+        # build_mavlink_interface. NavigationNode already clamps everything it
+        # commands, but a plan written into the FC's own mission slot is flown
+        # by AUTO with this process out of the loop entirely - so the ceiling
+        # has to be enforced here too, at the wire, whoever built the plan.
+        self._alt_ceiling: float = float(config.get("max_altitude_m", 2.0))
 
         self._master = None
         self._connected = False
@@ -92,6 +99,22 @@ class RealMavlink(MavlinkInterface):
         # Aux outputs we've already switched to "Disabled" (SERVOx_FUNCTION=0)
         # so MAV_CMD_DO_SET_SERVO can drive them. Done lazily, once per channel.
         self._servo_ready: set[int] = set()
+        # Last relative/terrain altitude from a message that actually carries
+        # one. VFR_HUD does not, and every Altitude we publish replaces the
+        # fusion node's single altitude slot, so a VFR_HUD-derived Altitude has
+        # to carry these forward rather than default them to 0.0.
+        self._last_rel_alt_m = 0.0
+        self._last_terrain_m = 0.0
+
+    def _clamp_mission_alt(self, alt: float, what: str) -> float:
+        """Hold a mission altitude to the ceiling, and say so when it bites."""
+        if alt <= self._alt_ceiling:
+            return alt
+        self.log.warning(
+            "mission upload: %s %.1f m exceeds the %.1f m ceiling - clamped",
+            what, alt, self._alt_ceiling,
+        )
+        return self._alt_ceiling
 
     # -- connection ----------------------------------------------------------
     @property
@@ -241,9 +264,10 @@ class RealMavlink(MavlinkInterface):
                 )
             )
         elif mtype == "GLOBAL_POSITION_INT":
+            self._last_rel_alt_m = msg.relative_alt / 1000.0
             result.append(
                 Altitude(
-                    relative_m=msg.relative_alt / 1000.0,
+                    relative_m=self._last_rel_alt_m,
                     amsl_m=msg.alt / 1000.0,
                 )
             )
@@ -318,10 +342,19 @@ class RealMavlink(MavlinkInterface):
                 )
             )
         elif mtype == "VFR_HUD":
+            # Carry the relative altitude forward: VFR_HUD has none of its own,
+            # and publishing the 0.0 default here erased it ten times a second.
             result.append(
-                Altitude(amsl_m=msg.alt, climb_ms=msg.climb)
+                Altitude(
+                    relative_m=self._last_rel_alt_m,
+                    amsl_m=msg.alt,
+                    terrain_m=self._last_terrain_m,
+                    climb_ms=msg.climb,
+                )
             )
         elif mtype == "ALTITUDE":
+            self._last_rel_alt_m = msg.altitude_relative
+            self._last_terrain_m = msg.altitude_terrain
             result.append(
                 Altitude(
                     relative_m=msg.altitude_relative,
@@ -355,6 +388,15 @@ class RealMavlink(MavlinkInterface):
                     self.log.warning("FC: %s", text)
                 else:
                     self.log.info("FC: %s", text)
+                lowered = text.lower()
+                result.append(
+                    FcMessage(
+                        text=text,
+                        severity=sev,
+                        is_prearm=lowered.startswith(("prearm", "arm:"))
+                        or "arm" in lowered.split(":")[0],
+                    )
+                )
         elif mtype == "COMMAND_ACK":
             try:
                 cmd = msg.command
@@ -406,6 +448,27 @@ class RealMavlink(MavlinkInterface):
             return self._set_mode(str(p.get("mode", "GUIDED")))
         if cmd == "rtl":
             return self._set_mode("RTL")
+        if cmd == "smart_rtl":
+            # SMART_RTL retraces the recorded outbound path. The FC rejects it
+            # if its path buffer is empty, so report the refusal and let the
+            # caller fall back rather than pretending it worked.
+            if self._set_mode("SMART_RTL"):
+                return True
+            self.log.warning("SMART_RTL unavailable - using RTL")
+            return self._set_mode("RTL")
+        if cmd == "set_home":
+            mav.command_long_send(
+                tgt_s, tgt_c, mavutil.mavlink.MAV_CMD_DO_SET_HOME, 0,
+                0, 0, 0, 0,
+                float(p.get("lat", 0.0)), float(p.get("lon", 0.0)),
+                float(p.get("alt", 0.0)),
+            )
+            return True
+        if cmd == "upload_mission":
+            return self._upload_mission(p)
+        if cmd == "clear_mission":
+            mav.mission_clear_all_send(tgt_s, tgt_c)
+            return True
         if cmd == "land":
             return self._set_mode("LAND")
         if cmd == "brake":
@@ -440,6 +503,28 @@ class RealMavlink(MavlinkInterface):
                 0, 0, 0, 0, 0,
             )
             return True
+        if cmd == "obstacle_distance":
+            # The FC's own proximity library. Unlike every other command here
+            # this one asks for nothing - it is a sensor feed, so it is safe to
+            # stream while a pilot is flying and it never touches flight mode.
+            distances = [int(d) for d in p.get("distances", [])]
+            if len(distances) != 72:
+                self.log.warning(
+                    "obstacle_distance needs 72 sectors, got %d", len(distances)
+                )
+                return False
+            mav.obstacle_distance_send(
+                int(time.time() * 1e6),                 # time_usec
+                0,                                      # MAV_DISTANCE_SENSOR_LASER
+                distances,                              # cm, 65535 = unknown
+                0,                                      # increment (deprecated)
+                int(p.get("min_cm", 15)),
+                int(p.get("max_cm", 1200)),
+                float(p.get("increment_deg", 5.0)),
+                0.0,                                    # angle_offset: sector 0 = nose
+                int(p.get("frame", 12)),                # MAV_FRAME_BODY_FRD
+            )
+            return True
         if cmd == "yaw":
             angle = abs(float(p.get("angle", 0.0)))
             direction = 1 if int(p.get("direction", 1)) >= 0 else -1
@@ -453,6 +538,32 @@ class RealMavlink(MavlinkInterface):
                 tgt_s, tgt_c, mavutil.mavlink.MAV_CMD_DO_CHANGE_SPEED, 0,
                 1, float(p.get("speed", 3.0)), -1, 0, 0, 0, 0,
             )
+            return True
+        if cmd == "set_param":
+            # Write one autopilot parameter as REAL32. ArduPilot accepts a
+            # float for every parameter type and converts on receipt, so the
+            # caller does not have to know whether the target is INT8 or float.
+            #
+            # Used to keep the FC's own avoidance margins in step with the
+            # GCS emergency-brake control: that slider has to move AVOID_MARGIN
+            # (simple avoidance, which is what limits the pilot in Loiter) and
+            # OA_MARGIN_MAX (path planning, which is what does the work in
+            # Guided/RTL) or the number on screen would only describe the Pi's
+            # own reactive layer and silently disagree with the aircraft.
+            name = str(p.get("name", "")).strip().upper()
+            if not name or len(name) > 16:
+                self.log.warning("set_param: bad parameter name %r", name)
+                return False
+            try:
+                value = float(p.get("value"))
+            except (TypeError, ValueError):
+                self.log.warning("set_param %s: value must be a number", name)
+                return False
+            mav.param_set_send(
+                tgt_s, tgt_c, name.encode(), value,
+                mavutil.mavlink.MAV_PARAM_TYPE_REAL32,
+            )
+            self.log.info("PARAM_SET %s = %g", name, value)
             return True
         if cmd == "set_servo":
             ch = int(p.get("channel", 9))
@@ -481,6 +592,99 @@ class RealMavlink(MavlinkInterface):
         if cmd == "noop":
             return True
         self.log.warning("unknown command '%s'", cmd)
+        return False
+
+    # -- mission upload ------------------------------------------------------
+    def _upload_mission(self, p: dict[str, Any]) -> bool:
+        """Write an expanded waypoint plan into the Pixhawk's mission slot.
+
+        The aircraft is flown in GUIDED (the navigator re-evaluates obstacles
+        between legs, which an on-FC AUTO mission cannot do), so this upload is
+        not what makes it move. It exists so the plan is *resident on the
+        autopilot*: visible in Mission Planner / QGroundControl, reviewable
+        before launch, and available as an AUTO fallback if the companion
+        computer drops off the link mid-flight.
+
+        Speaks the blocking MAVLink mission protocol (COUNT -> REQUEST xN ->
+        ACK). Runs on the MavlinkNode step thread, the same one that drains the
+        receive queue, so there is no reader racing us for the REQUESTs - at
+        the cost of pausing telemetry for the second or so it takes.
+
+        ``p`` carries ``home`` [lat, lon], ``items`` (the navigator's plan
+        dicts: lat/lon/alt_m/hold_s/kind), optional ``takeoff_alt`` and
+        ``return_mode``.
+        """
+        mav = self._master.mav
+        tgt_s, tgt_c = self._target_system, self._target_component
+        items = list(p.get("items") or [])
+        if not items:
+            self.log.warning("upload_mission: empty plan, nothing to send")
+            return False
+        home = p.get("home") or [items[0].get("lat", 0.0), items[0].get("lon", 0.0)]
+        takeoff_alt = self._clamp_mission_alt(
+            float(p.get("takeoff_alt", items[0].get("alt_m", 2.0))),
+            "takeoff altitude",
+        )
+        rel = mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT
+
+        # seq 0 is the home slot by ArduPilot convention: it is overwritten by
+        # the FC's own home and never flown, but the count has to include it.
+        plan = [(rel, mavutil.mavlink.MAV_CMD_NAV_WAYPOINT, 0.0, 0.0, 0.0, 0.0,
+                 float(home[0]), float(home[1]), 0.0)]
+        plan.append((rel, mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0.0, 0.0, 0.0, 0.0,
+                     float(home[0]), float(home[1]), takeoff_alt))
+        for it in items:
+            hold = float(it.get("hold_s", 0.0) or 0.0)
+            lat, lon = float(it["lat"]), float(it["lon"])
+            alt = self._clamp_mission_alt(
+                float(it.get("alt_m", takeoff_alt)), f"waypoint {len(plan)}"
+            )
+            if hold > 0:
+                # NAV_LOITER_TIME param1 = seconds to hold station on arrival.
+                plan.append((rel, mavutil.mavlink.MAV_CMD_NAV_LOITER_TIME,
+                             hold, 0.0, 0.0, 0.0, lat, lon, alt))
+            else:
+                plan.append((rel, mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
+                             0.0, 0.0, 0.0, 0.0, lat, lon, alt))
+        plan.append((rel, mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH,
+                     0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
+
+        mav.mission_clear_all_send(tgt_s, tgt_c)
+        self._master.recv_match(type=["MISSION_ACK"], blocking=True, timeout=2)
+        mav.mission_count_send(tgt_s, tgt_c, len(plan), 0)
+
+        deadline = time.time() + float(p.get("timeout_s", 20.0))
+        sent = 0
+        while time.time() < deadline:
+            msg = self._master.recv_match(
+                type=["MISSION_REQUEST", "MISSION_REQUEST_INT", "MISSION_ACK"],
+                blocking=True, timeout=2.0,
+            )
+            if msg is None:
+                continue
+            if msg.get_type() == "MISSION_ACK":
+                ok = msg.type == mavutil.mavlink.MAV_MISSION_ACCEPTED
+                if ok:
+                    self.log.info("mission uploaded: %d items accepted", len(plan))
+                else:
+                    self.log.error("mission rejected by FC (ACK type %d)", msg.type)
+                return ok
+            seq = int(msg.seq)
+            if not (0 <= seq < len(plan)):
+                continue
+            frame, cmd_id, p1, p2, p3, p4, lat, lon, alt = plan[seq]
+            mav.mission_item_int_send(
+                tgt_s, tgt_c, seq, frame, cmd_id,
+                0,                       # current
+                1,                       # autocontinue
+                p1, p2, p3, p4,
+                int(lat * 1e7), int(lon * 1e7), alt,
+                mavutil.mavlink.MAV_MISSION_TYPE_MISSION,
+            )
+            sent += 1
+        self.log.error(
+            "mission upload timed out after %d/%d items", sent, len(plan)
+        )
         return False
 
     def _set_mode(self, mode_name: str) -> bool:

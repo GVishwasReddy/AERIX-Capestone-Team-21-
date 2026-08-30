@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>AERIX GROUND CONTROL</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-<link rel="stylesheet" href="/static/style.css" />
+<link rel="stylesheet" href="/static/style.css?v=1787400000" />
 </head>
 <body data-theme="dark">
 <header id="hdr">
@@ -29,13 +29,68 @@
 <div class="app">
   <!-- LEFT SIDEBAR -->
   <aside class="sidebar">
-    <div class="sect"><h3>SCAN</h3>
-      <div class="btn-col">
-        <button data-cmd="scan_start">Start Scan</button>
-        <button data-cmd="scan_stop">Stop Scan</button>
-        <button data-cmd="scan_pause">Pause</button>
-        <button data-cmd="scan_resume">Resume</button>
+    <div class="sect"><h3>FLIGHT OVERRIDE</h3>
+      <div class="btn-row">
+        <button data-cmd="arm" class="ok">ARM</button>
+        <button data-cmd="disarm" class="danger">DISARM</button>
       </div>
+      <button data-cmd="emergency_stop" class="danger wide">EMERGENCY STOP</button>
+      <button data-cmd="emergency_land" class="amber wide">EMERGENCY LAND</button>
+      <div class="btn-row">
+        <button data-cmd="rtl">RTL</button>
+        <button data-cmd="land">LAND</button>
+      </div>
+      <!-- Hand control back after a transmitter takeover. Nothing clears the
+           override automatically, so this is the only way back to AUTO. -->
+      <button id="btn-resume" data-cmd="resume" class="wide"
+              title="Clear a transmitter takeover and hand control back to the ground station">RESUME · TAKE BACK CONTROL</button>
+      <!-- One-click "get flyable again" after ANY override/abort/finish, no Pi
+           restart needed: clears a latched transmitter takeover (same as
+           RESUME) AND a stuck "delivery in progress" flag (only when the
+           aircraft is actually disarmed - never touches a real flight). -->
+      <button id="btn-auto-mode" class="ok wide"
+              title="Clear a takeover and any stuck delivery state so a new mission can start - safe to press any time the aircraft is on the ground">◈ AUTO MODE · READY FOR NEXT MISSION</button>
+    </div>
+    <div class="sect" id="sect-delivery"><h3>DELIVERY · FIREBASE
+        <span id="dlv-link" class="link-dot" title="order source">●</span>
+        <span id="dlv-count" class="dlv-count">0</span>
+        <button id="dlv-refresh" class="icon-btn" title="Check Firebase for new orders now">↻</button></h3>
+
+      <!-- Order inbox: every order the app has written. Click one to select it. -->
+      <div id="dlv-inbox" class="dlv-inbox"></div>
+
+      <!-- The order currently offered or in flight. -->
+      <div id="dlv-card" class="dlv-card">
+        <div class="dlv-phase"><span id="dlv-phase" class="dlv-badge">IDLE</span>
+          <span id="dlv-order" class="dlv-order">no order</span></div>
+        <div id="dlv-track" class="dlv-track"></div>
+        <div id="dlv-msg" class="dlv-msg">waiting for orders</div>
+        <div class="dlv-grid">
+          <span>Target</span><b id="dlv-target">--</b>
+          <span>Distance</span><b id="dlv-dist">--</b>
+          <span>Waypoints</span><b id="dlv-wps">--</b>
+          <span>Hover</span><b id="dlv-hover">--</b>
+          <span>ETA</span><b id="dlv-eta">--</b>
+        </div>
+        <div id="dlv-bar-wrap" class="dlv-bar-wrap"><div id="dlv-bar" class="dlv-bar"></div></div>
+      </div>
+
+      <div class="btn-row">
+        <button id="dlv-accept" class="ok" disabled>ACCEPT &amp; FLY</button>
+        <button id="dlv-reject" disabled>Decline</button>
+      </div>
+      <button id="dlv-abort" class="danger wide" disabled>ABORT → RETURN HOME</button>
+      <div class="btn-row">
+        <button id="dlv-auto" class="tog">Auto-accept</button>
+        <button id="dlv-inject" title="Drop a test order at the map cursor">Test order</button>
+      </div>
+      <div id="dlv-setup" class="dlv-setup"></div>
+    </div>
+    <div class="sect"><h3>PAYLOAD · AUX1 SERVO</h3>
+      <div class="btn-row">
+        <button id="srv-lock">Lock</button>
+      </div>
+      <button id="srv-release" class="amber wide">Release Payload</button>
     </div>
     <div class="sect"><h3>AVOIDANCE</h3>
       <div class="btn-col">
@@ -53,23 +108,13 @@
         <input id="brake-dist" type="range" min="0.3" max="8" step="0.1" value="1.2">
       </div>
     </div>
-    <div class="sect"><h3>FLIGHT OVERRIDE</h3>
-      <div class="btn-row">
-        <button data-cmd="arm" class="ok">ARM</button>
-        <button data-cmd="disarm" class="danger">DISARM</button>
+    <div class="sect"><h3>SCAN</h3>
+      <div class="btn-col">
+        <button data-cmd="scan_start">Start Scan</button>
+        <button data-cmd="scan_stop">Stop Scan</button>
+        <button data-cmd="scan_pause">Pause</button>
+        <button data-cmd="scan_resume">Resume</button>
       </div>
-      <button data-cmd="emergency_stop" class="danger wide">EMERGENCY STOP</button>
-      <button data-cmd="emergency_land" class="amber wide">EMERGENCY LAND</button>
-      <div class="btn-row">
-        <button data-cmd="rtl">RTL</button>
-        <button data-cmd="land">LAND</button>
-      </div>
-    </div>
-    <div class="sect"><h3>PAYLOAD · AUX1 SERVO</h3>
-      <div class="btn-row">
-        <button id="srv-lock">Lock</button>
-      </div>
-      <button id="srv-release" class="amber wide">Release Payload</button>
     </div>
     <div class="sect"><h3>DATA</h3>
       <div class="btn-col">
@@ -166,6 +211,11 @@
       </div>
       <table id="tbl-mission" class="kv"></table>
     </div>
+    <div class="panel"><div class="panel-hd"><span>● Delivery</span>
+        <span id="dlv-hd-phase" class="hd-badge">IDLE</span></div>
+      <div id="dlv-book" class="dlv-book"></div>
+      <table id="tbl-delivery" class="kv"></table>
+    </div>
     <div class="panel"><div class="panel-hd"><span>● System Health</span></div>
       <table id="tbl-health" class="kv"></table>
       <div id="health-spark" class="sparks"></div>
@@ -197,7 +247,7 @@
   </div>
 </div>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-<script src="/static/app.js?v=1786500000"></script>
+<script src="/static/app.js?v=1787510000"></script>
 <script type="importmap">
 {
   "imports": {

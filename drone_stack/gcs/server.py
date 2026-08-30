@@ -66,6 +66,16 @@ def create_app(config: Config) -> "FastAPI":
     async def index():
         return FileResponse(_STATIC / "index.html")
 
+    @app.get("/api/state")
+    async def state():
+        """One-shot snapshot of exactly what the WebSocket streams.
+
+        Lets scripts (scripts/inject_order.py) and health checks read live
+        state without opening a WebSocket, and makes the delivery panel's data
+        inspectable with curl when something looks wrong on the dashboard.
+        """
+        return JSONResponse(hub.build_payload())
+
     @app.get("/api/logs")
     async def logs():
         return JSONResponse({"logs": hub.list_logs()})

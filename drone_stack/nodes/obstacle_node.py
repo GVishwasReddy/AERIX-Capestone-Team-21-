@@ -18,15 +18,18 @@ from __future__ import annotations
 
 import math
 import threading
+import time
 
 from drone_stack.bus import MessageBus
 from drone_stack.bus.topics import Topics
 from drone_stack.msg import (
+    FusedState,
     LaserScan,
     Obstacle,
     ObstacleArray,
     ObstacleClass,
 )
+from drone_stack.nodes.obstacle_tracker import ObstacleTracker
 from drone_stack.utils.config import Config
 from drone_stack.utils.geometry import polar_to_cartesian, wrap_180
 from drone_stack.utils.node import NodeBase
@@ -65,21 +68,51 @@ class ObstacleNode(NodeBase):
         self._vehicle_range = tuple(section.get("vehicle_width_range_m", [1.20, 4.00]))
         self._wall_min = float(section.get("wall_min_length_m", 2.50))
 
+        # Frame-to-frame tracking. Without it an obstacle's identity is its
+        # index in a distance-sorted list, so nothing downstream can tell that
+        # the cluster 2 m ahead is the one that was 3 m ahead a tenth of a
+        # second ago - which is why avoidance only ever saw static objects.
+        tracking = section.get("tracking", {}) or {}
+        self._tracking_enabled = bool(tracking.get("enabled", True))
+        self._tracker = ObstacleTracker(
+            gate_m=float(tracking.get("gate_m", 1.2)),
+            max_misses=int(tracking.get("max_misses", 3)),
+            min_hits=int(tracking.get("min_hits", 2)),
+            alpha=float(tracking.get("alpha", 0.5)),
+            dynamic_speed_ms=float(tracking.get("dynamic_speed_ms", 0.5)),
+            dynamic_min_hits=int(tracking.get("dynamic_min_hits", 3)),
+            max_speed_ms=float(tracking.get("max_speed_ms", 6.0)),
+        )
+
         self._latest_scan: LaserScan | None = None
+        self._fused: FusedState | None = None
         self._lock = threading.Lock()
         self.subscribe(Topics.SCAN, self._on_scan)
+        # Ego-motion, so a wall we are flying past is not reported as a wall
+        # flying past us. Translation AND yaw rate both matter here.
+        self.subscribe(Topics.FUSED_STATE, self._on_fused)
 
     def _on_scan(self, msg) -> None:
         if isinstance(msg, LaserScan):
             with self._lock:
                 self._latest_scan = msg
 
+    def _on_fused(self, msg) -> None:
+        if isinstance(msg, FusedState):
+            with self._lock:
+                self._fused = msg
+
     def step(self) -> None:
         with self._lock:
             scan = self._latest_scan
+            ego = self._fused
         if scan is None or scan.count == 0:
             return
         obstacles = self._detect(scan)
+        if self._tracking_enabled:
+            # Tracked *before* publishing, so every consumer sees the same
+            # velocities rather than each deriving its own.
+            obstacles = self._tracker.update(obstacles, time.monotonic(), ego)
         self.publish(
             Topics.OBSTACLES,
             ObstacleArray(frame_id="base_link", obstacles=obstacles),

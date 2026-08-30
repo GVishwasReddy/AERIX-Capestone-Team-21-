@@ -61,8 +61,14 @@ class ServiceRegistry:
         with self._lock:
             return sorted(self._handlers)
 
-    def call(self, name: str, **data: Any) -> ServiceResponse:
-        """Invoke a service by name; never raises - failures are captured."""
+    def call(self, name: str, /, **data: Any) -> ServiceResponse:
+        """Invoke a service by name; never raises - failures are captured.
+
+        ``name`` is positional-only: the dashboard forwards arbitrary command
+        payloads straight through here, and a payload that happens to carry a
+        ``name`` key (a mission name, an order name) must land in ``data``
+        rather than colliding with the service being called.
+        """
         with self._lock:
             handler = self._handlers.get(name)
         if handler is None:

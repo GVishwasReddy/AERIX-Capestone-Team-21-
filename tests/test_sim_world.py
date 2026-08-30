@@ -43,6 +43,49 @@ def test_goto_moves_horizontally():
     assert world.state.x > 5.0
 
 
+def test_position_hold_parks_the_aircraft():
+    """POSHOLD is what the delivery hover sits in - it must actually stop."""
+    world = _world()
+    world.command(NavCommand("arm"))
+    world.command(NavCommand("takeoff", {"altitude": 3.0}))
+    for _ in range(60):
+        world.step(dt=0.1)
+    lat, lon, _ = world.home
+    tgt_lat, tgt_lon = enu_to_geodetic(20.0, 0.0, lat, lon)
+    world.command(NavCommand("goto", {"lat": tgt_lat, "lon": tgt_lon, "alt": 3.0}))
+    for _ in range(60):
+        world.step(dt=0.1)
+    world.command(NavCommand("set_mode", {"mode": "POSHOLD"}))
+    held = world.state.x
+    for _ in range(100):
+        world.step(dt=0.1)
+    assert abs(world.state.x - held) < 0.6
+    assert world.state.armed
+
+
+def test_smart_rtl_comes_home_descends_and_disarms():
+    """The whole delivery ends here: without the descent-and-disarm stage the
+    mission would sit in RTL forever and never report COMPLETE."""
+    world = _world()
+    world.command(NavCommand("arm"))
+    world.command(NavCommand("takeoff", {"altitude": 3.0}))
+    for _ in range(60):
+        world.step(dt=0.1)
+    lat, lon, _ = world.home
+    tgt_lat, tgt_lon = enu_to_geodetic(25.0, 0.0, lat, lon)
+    world.command(NavCommand("goto", {"lat": tgt_lat, "lon": tgt_lon, "alt": 3.0}))
+    for _ in range(80):
+        world.step(dt=0.1)
+    world.command(NavCommand("set_mode", {"mode": "SMART_RTL"}))
+    for _ in range(1200):
+        world.step(dt=0.1)
+        if not world.state.armed:
+            break
+    assert not world.state.armed
+    assert math.hypot(world.state.x, world.state.y) < 1.5
+    assert world.state.z <= 0.05
+
+
 def test_raycast_hits_wall():
     world = _world()  # default config has a wall centred at x=8, width 6 -> face at x=5
     distance = world.raycast(world_angle=0.0, max_range=12.0)

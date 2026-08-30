@@ -58,8 +58,19 @@ class NodeBase(threading.Thread):
         """Called on shutdown and after a crash. Must be safe to call twice."""
 
     # -- helpers for subclasses ---------------------------------------------
-    def subscribe(self, topic: str, callback: Callable) -> Subscription:
-        sub = self.bus.subscribe(topic, callback)
+    def subscribe(
+        self, topic: str, callback: Callable, deliver_latched: bool = True
+    ) -> Subscription:
+        """Subscribe, keeping the handle so the node can unsubscribe on stop.
+
+        Pass ``deliver_latched=False`` for *command* topics. The bus latches
+        every topic and replays the last message to each new subscriber, which
+        is right for state (a fresh node wants the current battery reading) and
+        wrong for events: when the supervisor watchdog recreates a dead node,
+        its constructor re-subscribes and would immediately re-execute the last
+        command that was ever sent.
+        """
+        sub = self.bus.subscribe(topic, callback, deliver_latched=deliver_latched)
         self._subscriptions.append(sub)
         return sub
 

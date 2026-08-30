@@ -24,8 +24,9 @@ from typing import Any
 from drone_stack.bus import MessageBus
 from drone_stack.bus.topics import Topics
 from drone_stack.gcs.cameras import CameraManager
+from drone_stack.interfaces.lidar_interface import FovMask
 from drone_stack.launch.bringup import build_supervisor
-from drone_stack.msg import NavCommand, to_dict
+from drone_stack.msg import DeliveryBleResult, NavCommand, to_dict
 from drone_stack.srv import ServiceRegistry
 from drone_stack.utils.config import Config
 from drone_stack.utils.geometry import enu_to_geodetic, geodetic_to_enu, haversine_m
@@ -83,6 +84,14 @@ class GcsHub:
         self._rate_time = time.monotonic()
         self._rates = {"mavlink": 0.0, "lidar": 0.0, "radar": 0.0}
 
+        # LiDAR field of view, front-referenced. Sent every frame (not only
+        # when a scan arrives) so the radar can draw the 0 deg front line and
+        # the ignored rear wedge even while the sensor is down.
+        self._lidar_fov = FovMask(config.section("lidar")).describe()
+        self._lidar_fov["front_offset_deg"] = float(
+            config.get("lidar.angle_offset_deg", 0.0)
+        )
+
         # record / replay
         self._record_fp = None
         self._record_name: str | None = None
@@ -93,16 +102,25 @@ class GcsHub:
         # Shares self.bus so the novelty-layer overlay processors can publish
         # PersonDetection/SegmentationFrame for DeliveryNode - see
         # cameras.py's own "Novelty layer tap" docstring section.
-        self.cameras = CameraManager(bus=self.bus)
+        self.cameras = CameraManager(
+            bus=self.bus,
+            enabled=bool(config.get("cameras.enabled", True)),
+        )
 
         self._console_handler = _ConsoleHandler(self._push_console)
         logging.getLogger("drone").addHandler(self._console_handler)
         self.bus.subscribe(Topics.GPS, self._on_gps)
+        self.bus.subscribe(Topics.MISSION_STATE, self._on_mission_state)
 
     # -- lifecycle -----------------------------------------------------------
     def start(self) -> None:
         self.supervisor.start()
+        # Cameras are opt-out (cameras.enabled). CameraManager.start() is a
+        # no-op when they are off, so both this and the lazy start in the
+        # /api/camera stream handler are covered by the one gate.
         self.cameras.start()
+        if not self.cameras.enabled:
+            self._push_console("INFO", "gcs", "cameras disabled by config")
         self._push_console("INFO", "gcs", f"GCS engine started ({self.config.mode} mode)")
 
     def stop(self) -> None:
@@ -124,12 +142,18 @@ class GcsHub:
             "msg": msg,
         })
 
+    def _on_mission_state(self, msg) -> None:
+        """The navigator owns home; the map just draws it."""
+        try:
+            if getattr(msg, "home_set", False):
+                self._home = (msg.home_lat, msg.home_lon)
+        except Exception:  # noqa: BLE001
+            pass
+
     def _on_gps(self, msg) -> None:
         try:
             if getattr(msg, "fix_type", 0) < 3:
                 return
-            if self._home is None:
-                self._home = (msg.lat, msg.lon)
             if not self._trail or haversine_m(
                 self._trail[-1][0], self._trail[-1][1], msg.lat, msg.lon
             ) > 0.7:
@@ -180,6 +204,29 @@ class GcsHub:
                     pass
         return payload
 
+    @staticmethod
+    def _rc_payload(rc) -> dict:
+        """Transmitter state, so the pilot can see the link before it matters.
+
+        The navigator hands control to whoever moves the transmitter's mode
+        switch, so "is the RC link actually up?" is a pre-flight question the
+        dashboard should answer, not one to discover in the air.
+        """
+        if rc is None:
+            return {"connected": False, "channels": [], "count": 0, "rssi": 0,
+                    "age_s": None}
+        age = max(0.0, time.time() - float(getattr(rc, "stamp", 0.0) or 0.0))
+        channels = [int(c) for c in (getattr(rc, "channels", []) or [])]
+        # RC_CHANNELS keeps arriving for a moment after the transmitter is off,
+        # so treat a stale frame as no link rather than a live one.
+        return {
+            "connected": age < 3.0 and any(c > 0 for c in channels),
+            "channels": channels,
+            "count": int(getattr(rc, "count", 0) or 0),
+            "rssi": int(getattr(rc, "rssi", 0) or 0),
+            "age_s": round(age, 1),
+        }
+
     def _live_payload(self) -> dict:
         self._update_rates()
         snap = self.bus.snapshot()
@@ -203,6 +250,7 @@ class GcsHub:
         mission = latest(Topics.MISSION_STATE)
         plan = latest(Topics.MISSION_PLAN)
         diag = latest(Topics.DIAGNOSTICS)
+        delivery = latest(Topics.DELIVERY_STATE)
 
         fix = getattr(gps, "fix_type", 0)
         gps_fix = {0: "none", 1: "none", 2: "2D", 3: "3D"}.get(fix, "RTK")
@@ -226,9 +274,16 @@ class GcsHub:
         }
 
         home_lat, home_lon = (self._home or (None, None))
+        # Without a 3D fix the autopilot still reports a lat/lon - the EKF's
+        # last known or dead-reckoned guess - and plotting it puts a confident
+        # marker on the map somewhere the aircraft is not. Send null instead
+        # and let the dashboard say "no fix"; a missing dot is honest, a wrong
+        # dot is not.
+        has_fix = fix >= 3
         position = {
-            "lat": getattr(gps, "lat", 0.0),
-            "lon": getattr(gps, "lon", 0.0),
+            "lat": getattr(gps, "lat", 0.0) if has_fix else None,
+            "lon": getattr(gps, "lon", 0.0) if has_fix else None,
+            "fix": has_fix,
             "alt": telemetry["altitude"],
             "heading": telemetry["heading"],
             "home_lat": home_lat,
@@ -256,6 +311,15 @@ class GcsHub:
                     "y": round(o.y_m, 2),
                     "danger": o.danger,
                     "confidence": round(o.confidence, 2),
+                    # Tracking. `id` above is the per-frame cluster index and
+                    # changes whenever anything closer appears; track_id is the
+                    # stable identity the velocities are accumulated against,
+                    # so the panel can follow one object across revolutions.
+                    "track_id": o.track_id,
+                    "hits": o.hits,
+                    "closing_ms": o.closing_ms,
+                    "speed_ms": o.speed_m_s,
+                    "dynamic": o.is_dynamic,
                 })
 
         waypoints = self._mission_waypoints(plan)
@@ -280,8 +344,10 @@ class GcsHub:
             },
             "telemetry": telemetry,
             "position": position,
+            "rc": self._rc_payload(latest(Topics.RC)),
             "trail": list(self._trail),
             "scan": scan_payload,
+            "lidar_fov": self._lidar_fov,
             "obstacles": obstacles,
             "avoidance": to_dict(avoid) if avoid is not None else None,
             "mission": {
@@ -290,14 +356,64 @@ class GcsHub:
                 "total_wp": getattr(mission, "total_wp", 0),
                 "message": getattr(mission, "message", ""),
                 "avoiding": getattr(mission, "avoiding", False),
+                "pilot_override": getattr(mission, "pilot_override", False),
+                "alt_ceiling_m": getattr(mission, "alt_ceiling_m", 0.0),
+                "arm_refusal": getattr(mission, "arm_refusal", ""),
                 "waypoints": waypoints,
             },
+            "delivery": self._delivery_payload(delivery),
             "health": health,
             "cameras": self._camera_info(obstacles),
             "console": list(self._console)[-60:],
             "replay": {"active": False},
         }
         return _sanitize(payload)
+
+    def _delivery_payload(self, state) -> dict:
+        """The Firebase delivery panel's whole data source.
+
+        Mirrors FirebaseDeliveryNode's published DeliveryState rather than
+        recomputing anything, so what the operator sees on the dashboard is the
+        state the node is actually acting on. Returns a fully-populated dict
+        even when the node is absent, so the front-end never has to null-check.
+        """
+        if state is None:
+            return {
+                "phase": "IDLE", "order_id": "", "recipient_id": "",
+                "target_lat": 0.0, "target_lon": 0.0,
+                "hover_alt_m": 0.0, "hover_seconds": 0.0,
+                "hover_remaining_s": 0.0, "distance_m": 0.0,
+                "remaining_m": 0.0, "waypoints": 0,
+                "auto_accept": False, "fc_mission_uploaded": False,
+                "link": "disabled", "message": "delivery node not running",
+                "last_error": "", "active": False,
+                "orders": [], "recent": [], "selected_order_id": "",
+            }
+        phase = getattr(getattr(state, "phase", None), "value", "IDLE")
+        return {
+            "phase": phase,
+            "order_id": getattr(state, "order_id", ""),
+            "recipient_id": getattr(state, "recipient_id", ""),
+            "target_lat": getattr(state, "target_lat", 0.0),
+            "target_lon": getattr(state, "target_lon", 0.0),
+            "hover_alt_m": getattr(state, "hover_alt_m", 0.0),
+            "hover_seconds": getattr(state, "hover_seconds", 0.0),
+            "hover_remaining_s": getattr(state, "hover_remaining_s", 0.0),
+            "distance_m": getattr(state, "distance_m", 0.0),
+            "remaining_m": getattr(state, "remaining_m", 0.0),
+            "waypoints": getattr(state, "waypoints", 0),
+            "auto_accept": bool(getattr(state, "auto_accept", False)),
+            "fc_mission_uploaded": bool(getattr(state, "fc_mission_uploaded", False)),
+            "link": getattr(state, "link", "disabled"),
+            "message": getattr(state, "message", ""),
+            "last_error": getattr(state, "last_error", ""),
+            "active": phase in ("ACCEPTED", "ENROUTE", "HOVERING", "RETURNING"),
+            # The order book: everything the app has written, so the operator
+            # can see an order arrive even before anyone accepts it.
+            "orders": list(getattr(state, "orders", []) or []),
+            "recent": list(getattr(state, "recent", []) or []),
+            "selected_order_id": getattr(state, "selected_order_id", ""),
+        }
 
     def _mission_waypoints(self, plan) -> list[dict]:
         out: list[dict] = []
@@ -386,6 +502,8 @@ class GcsHub:
             return self.set_source(p.get("mode", "sim"))
         if cmd == "ble_auth_event":
             return self._on_ble_auth_event(p)
+        if cmd == "ble_delivery_result":
+            return self._on_ble_delivery_result(p)
         if cmd == "set_servo":
             # Payload servo on a Pixhawk AUX output (AUX1 == channel 9).
             ch = int(p.get("channel", 9))
@@ -435,6 +553,29 @@ class GcsHub:
             "INFO", "ble", f"BLE auth event: authenticated={event.authenticated}"
         )
         return {"ok": True, "message": "ble auth event published"}
+
+    def _on_ble_delivery_result(self, p: dict) -> dict:
+        """Bridge for drone_ble_peripheral.py's ``drop_characteristic``: once
+        its own security gates (HMAC mutual auth, micro-geofence, DROP HMAC)
+        all pass for the order being flown, it POSTs here so the CORE flight
+        profile (CLAUDE.md §11 - not the optional novelty layer) can react.
+
+        Published on ``Topics.DELIVERY_BLE_RESULT`` unconditionally (unlike
+        ``_on_ble_auth_event``'s lazy novelty-only bridge above), because
+        ``NavigationNode`` - the node driving the delivery hover/RTL profile -
+        is always running, whether or not ``novelty.enabled`` is set. See
+        ``NavigationNode._on_ble_delivery_result``.
+        """
+        event = DeliveryBleResult(
+            order_id=str(p.get("order_id", "")),
+            success=bool(p.get("success", False)),
+        )
+        self.bus.publish(Topics.DELIVERY_BLE_RESULT, event)
+        self._push_console(
+            "INFO", "ble",
+            f"BLE delivery result: order={event.order_id} success={event.success}",
+        )
+        return {"ok": True, "message": "ble delivery result published"}
 
     def _home_or(self, default_lat: float, default_lon: float) -> tuple[float, float]:
         return self._home if self._home is not None else (default_lat, default_lon)

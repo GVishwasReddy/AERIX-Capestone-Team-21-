@@ -24,11 +24,13 @@ from drone_stack.launch.builders import (
 )
 from drone_stack.nodes import (
     DiagnosticsNode,
+    FirebaseDeliveryNode,
     FusionNode,
     LidarNode,
     MavlinkNode,
     NavigationNode,
     ObstacleNode,
+    ProximityNode,
 )
 from drone_stack.srv import ServiceRegistry
 from drone_stack.utils.config import Config
@@ -71,11 +73,26 @@ def build_supervisor(
     if config.get("obstacles.enabled", True):
         supervisor.add(lambda: ObstacleNode(bus, config))
 
+    if config.get("proximity.enabled", False):
+        # Started before the navigator: this is the avoidance that keeps
+        # working when the pilot takes the sticks and the navigator stands
+        # down. It only feeds the FC's proximity library - it issues no flight
+        # commands and never changes mode.
+        supervisor.add(lambda: ProximityNode(bus, config))
+
     if config.get("navigation.enabled", True):
         supervisor.add(lambda: NavigationNode(bus, config, services))
 
     if config.get("diagnostics.enabled", True):
         supervisor.add(lambda: DiagnosticsNode(bus, config))
+
+    if config.get("delivery.enabled", True):
+        # Started after NavigationNode because it drives the aircraft entirely
+        # through that node's services (set_delivery_target / start_mission),
+        # so the flight-safety rules apply to a Firebase order exactly as they
+        # do to anything else. Its order source degrades to "no-credentials"
+        # rather than failing, so a Pi without a Firebase key still boots.
+        supervisor.add(lambda: FirebaseDeliveryNode(bus, config, services))
 
     if config.get("novelty.enabled", False):
         # Lazily imported (unlike every node above) so a deployment that

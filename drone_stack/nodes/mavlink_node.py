@@ -23,7 +23,9 @@ from drone_stack.msg import (
     Heartbeat,
     Imu,
     LinkQuality,
+    MissionUploadResult,
     NavCommand,
+    FcMessage,
     RcChannels,
     SystemStatus,
     Velocity,
@@ -48,6 +50,7 @@ class MavlinkNode(NodeBase):
         ArmedStatus: Topics.ARMED,
         SystemStatus: Topics.SYS_STATUS,
         RcChannels: Topics.RC,
+        FcMessage: Topics.FC_MESSAGE,
     }
 
     def __init__(
@@ -69,7 +72,11 @@ class MavlinkNode(NodeBase):
         self._payload_lock_us = int(pl.get("lock_us", 1100))
         self._payload_release_us = int(pl.get("release_us", 1410))
         self._payload_released: bool | None = None
-        self.subscribe(Topics.MAVLINK_CMD, self._on_command)
+        # No latched replay: commands are events. _on_command queues straight
+        # into _cmd_queue and step() sends it to the autopilot, so a replay on
+        # watchdog recreation would re-issue the last command - an 'arm' or
+        # 'takeoff' spinning the props back up with nobody asking.
+        self.subscribe(Topics.MAVLINK_CMD, self._on_command, deliver_latched=False)
 
     def _on_command(self, msg) -> None:
         if isinstance(msg, NavCommand):
@@ -148,6 +155,9 @@ class MavlinkNode(NodeBase):
             NavCommand("set_servo", {"channel": self._payload_out_ch, "pwm": pwm})
         )
 
+    #: Commands that stream continuously rather than being issued once.
+    _QUIET_COMMANDS = frozenset({"obstacle_distance"})
+
     def _flush_commands(self) -> None:
         while True:
             with self._cmd_lock:
@@ -155,11 +165,35 @@ class MavlinkNode(NodeBase):
                     return
                 command = self._cmd_queue.popleft()
             accepted = self.iface.send_command(command)
-            self.log.info(
-                "command '%s' %s",
-                command.command,
-                "sent" if accepted else "REJECTED",
-            )
+            if command.command in self._QUIET_COMMANDS and accepted:
+                # High-rate sensor feeds, not operator actions. Logging one
+                # line per send at 10 Hz buries every real event in the
+                # journal. Rejections still log - those matter.
+                self.log.debug("command '%s' sent", command.command)
+            else:
+                self.log.info(
+                    "command '%s' %s",
+                    command.command,
+                    "sent" if accepted else "REJECTED",
+                )
+            if command.command == "upload_mission":
+                # Uploading runs the blocking MAVLink mission handshake on this
+                # thread, so by the time send_command returns we know whether
+                # the autopilot took the plan. Say so, rather than leaving the
+                # delivery panel to guess.
+                items = len(command.params.get("items") or [])
+                self.publish(
+                    Topics.MISSION_UPLOAD,
+                    MissionUploadResult(
+                        ok=bool(accepted),
+                        items=items,
+                        message=(
+                            f"{items} waypoints written to the flight controller"
+                            if accepted
+                            else "flight controller refused the mission upload"
+                        ),
+                    ),
+                )
 
     def on_stop(self) -> None:
         try:

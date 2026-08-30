@@ -81,15 +81,26 @@ class ComplementaryEstimator(StateEstimator):
         if sensors.imu is not None:
             state.sources.append("imu")
 
-        # Establish home from the first valid GPS fix.
+        # The ENU origin is NOT chosen here. It is the navigator's home,
+        # pushed in via set_home (see FusionNode._on_mission_state).
+        #
+        # This class used to latch it from the first fix with has_fix - any
+        # quality, never revised. That produced a second origin disagreeing
+        # with the navigator's: x/y were measured from one point and converted
+        # back to lat/lon against another, so the geofence measured from the
+        # wrong place and every relative move landed short or long by the
+        # difference. One origin, one authority.
+        #
+        # Until an origin exists, x/y stay zero rather than being measured
+        # from a guess: zero reads as "at home", which is where the aircraft
+        # is while it waits on the ground for a fix good enough to launch on.
         gps = sensors.gps
         if self._use_gps and gps is not None and gps.has_fix:
-            if self._home_lat is None:
-                self.set_home(gps.lat, gps.lon, gps.alt_amsl_m)
-            east, north = geodetic_to_enu(
-                gps.lat, gps.lon, self._home_lat, self._home_lon
-            )
-            state.x, state.y = east, north
+            if self._home_lat is not None:
+                east, north = geodetic_to_enu(
+                    gps.lat, gps.lon, self._home_lat, self._home_lon
+                )
+                state.x, state.y = east, north
             state.lat, state.lon = gps.lat, gps.lon
             state.alt_amsl_m = gps.alt_amsl_m
             state.sources.append("gps")
@@ -160,6 +171,25 @@ class FusionNode(NodeBase):
         self.subscribe(Topics.ALTITUDE, self._make_setter("altitude"))
         self.subscribe(Topics.VELOCITY, self._make_setter("velocity"))
         self.subscribe(Topics.SCAN, self._make_setter("scan"))
+        self.subscribe(Topics.MISSION_STATE, self._on_mission_state)
+
+    def _on_mission_state(self, msg) -> None:
+        """Adopt the navigator's home as the ENU origin.
+
+        The navigator gates home on GPS quality and freezes it at arming, so
+        following it means the fused x/y are displacement from the point the
+        aircraft actually took off from - the same point ArduPilot latches as
+        its own home at arming, and therefore the point RTL returns to.
+        """
+        if not getattr(msg, "home_set", False):
+            return
+        lat, lon = msg.home_lat, msg.home_lon
+        est = self.estimator
+        if est._home_lat == lat and est._home_lon == lon:
+            return
+        with self._lock:
+            alt = getattr(self._snapshot.gps, "alt_amsl_m", 0.0) or 0.0
+        est.set_home(lat, lon, alt)
 
     def _make_setter(self, attr: str):
         def _setter(msg) -> None:

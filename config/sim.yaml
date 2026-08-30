@@ -15,3 +15,14 @@ mavlink:
 web:
   enabled: true
   port: 8090
+
+# Simulation is the safety net: orders are accepted and flown automatically so
+# the whole Firebase -> waypoints -> hover -> RTL path can be exercised without
+# a human in the loop, and without touching Firebase at all.
+delivery:
+  enabled: true
+  source: file
+  auto_accept: true
+  upload_to_fc: false
+  write_back: false
+  max_delivery_radius_m: 500.0

@@ -6,6 +6,9 @@ let localWps = [];            // [{lat,lon,alt}]  (map-editable mission)
 let lastConsoleId = 0;
 let seededConsole = false;    // suppress toasts for the console backlog on first load
 let radarMax = 12;            // radar range in metres (zoomable)
+let dlvTargetMarker = null, dlvRouteLine = null;
+let lastDlvPhase = null;      // for phase-change toasts (null = not yet seeded)
+let cursorLatLng = null;      // last map cursor position, for "Test order"
 
 /* ---------- NL command history (Up/Down recall, like a shell) ---------- */
 const NL_HISTORY_KEY = "aerix_nl_history", NL_HISTORY_MAX = 50;
@@ -49,6 +52,7 @@ const fmt = (x, d = 1) => (x === undefined || x === null) ? "--" : Number(x).toF
 function setPill(el, text, cls) { el.textContent = text; el.className = "pill " + (cls || ""); }
 
 /* ---------- translucent centre-screen announcement ---------- */
+let lastOverride = null;
 let lastMode = null;         // last flight mode we announced (null = not yet seeded)
 let _toastTimer = null;
 function showToast(text, cls) {
@@ -95,6 +99,104 @@ function buildModeGrid() {
   });
 }
 
+/* ---------- lidar field of view ---------- */
+// The LiDAR's front face is the 0-degree reference: straight up on the radar,
+// pointing at the nose of the airframe. `fov_deg` (250) is the arc actually
+// scanned - 125 deg left + 125 deg right - and the rest, the wedge directly
+// behind, is blanked in the driver so nothing back there ever reaches obstacle
+// avoidance. Bearings here are the radar's own convention: 0 = front,
+// positive clockwise (to the right).
+const DEFAULT_LIDAR_FOV = { enabled: true, fov_deg: 250, half_deg: 125, blind_deg: 110 };
+
+function fovRay(cx, cy, bearing, r) {
+  const rad = (bearing - 90) * Math.PI / 180;
+  return [cx + Math.cos(rad) * r, cy + Math.sin(rad) * r];
+}
+
+// Ignored rear wedge + the two FOV boundary spokes. Drawn UNDER the returns.
+function drawFovMask(ctx, cx, cy, R, fov) {
+  if (!fov.enabled || !(fov.blind_deg > 0.01)) return;
+  const half = fov.half_deg;
+  const a0 = (half - 90) * Math.PI / 180;          // +135 deg -> back-right
+  const a1 = (360 - half - 90) * Math.PI / 180;    // -135 deg -> back-left
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.moveTo(cx, cy);
+  ctx.arc(cx, cy, R, a0, a1);
+  ctx.closePath();
+  ctx.fillStyle = "rgba(255,77,79,0.08)";
+  ctx.fill();
+  ctx.clip();
+  ctx.strokeStyle = "rgba(255,77,79,0.18)";
+  ctx.lineWidth = 1;
+  for (let k = -2 * R; k < 2 * R; k += 10) {       // 45-deg hatching
+    ctx.beginPath(); ctx.moveTo(cx + k, cy - R); ctx.lineTo(cx + k + 2 * R, cy + R); ctx.stroke();
+  }
+  ctx.restore();
+
+  ctx.save();
+  ctx.strokeStyle = "rgba(255,77,79,0.6)";
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash([5, 4]);
+  [half, 360 - half].forEach((b) => {
+    const [x, y] = fovRay(cx, cy, b, R);
+    ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(x, y); ctx.stroke();
+  });
+  ctx.restore();
+
+  // FOV edge labels, pulled inside the ring so they clear the 45-deg spokes.
+  ctx.save();
+  ctx.font = "10px monospace";
+  ctx.fillStyle = "#ff9a9a";
+  ctx.textAlign = "center";
+  const [rx, ry] = fovRay(cx, cy, half, R * 0.62);
+  const [lx, ly] = fovRay(cx, cy, -half, R * 0.62);
+  ctx.fillText("+" + fmt(half, 0) + "\u00b0", rx, ry);
+  ctx.fillText("-" + fmt(half, 0) + "\u00b0", lx, ly);
+  const [bx, by] = fovRay(cx, cy, 180, R * 0.55);
+  ctx.fillText("IGNORED " + fmt(fov.blind_deg, 0) + "\u00b0", bx, by);
+  ctx.restore();
+}
+
+// 0-degree front reference line + the active-sweep arc. Drawn OVER the returns
+// so the mark stays readable in a dense scan.
+function drawFovFront(ctx, cx, cy, R, fov) {
+  const half = fov.enabled ? fov.half_deg : 180;
+  ctx.save();
+
+  // active sweep arc across the scanned window
+  ctx.strokeStyle = "rgba(56,224,123,0.45)";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(cx, cy, R, (-half - 90) * Math.PI / 180, (half - 90) * Math.PI / 180);
+  ctx.stroke();
+
+  // the front line itself: centre -> rim, straight up = LiDAR front = 0 deg
+  ctx.strokeStyle = "#38e07b";
+  ctx.lineWidth = 2.5;
+  ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(cx, cy - R); ctx.stroke();
+  ctx.fillStyle = "#38e07b";
+  ctx.beginPath();                                  // arrow head at the rim
+  ctx.moveTo(cx, cy - R - 7);
+  ctx.lineTo(cx - 5, cy - R + 3);
+  ctx.lineTo(cx + 5, cy - R + 3);
+  ctx.closePath(); ctx.fill();
+
+  ctx.font = "bold 10px monospace";
+  ctx.textAlign = "center";
+  ctx.fillText("LIDAR FRONT 0\u00b0", cx, cy - R * 0.55);
+
+  ctx.textAlign = "left";
+  ctx.font = "9px monospace";
+  ctx.fillStyle = fov.enabled ? "#7fd8a5" : "#3a5566";
+  const caption = fov.enabled
+    ? "FOV " + fmt(fov.fov_deg, 0) + "\u00b0 \u00b7 REAR " + fmt(fov.blind_deg, 0) + "\u00b0 MASKED"
+    : "FOV 360\u00b0 \u00b7 no mask";
+  ctx.fillText(caption, 6, ctx.canvas.height - 6);
+  ctx.restore();
+}
+
 /* ---------- radar ---------- */
 function drawRadar(d) {
   const c = $("radar"), ctx = c.getContext("2d");
@@ -115,6 +217,8 @@ function drawRadar(d) {
     ctx.fillStyle = "#3a5566";
     ctx.fillText(a + "°", cx + Math.cos(rad) * (R + 8) - 6, cy + Math.sin(rad) * (R + 8) + 3);
   }
+  const fov = d.lidar_fov || DEFAULT_LIDAR_FOV;
+  drawFovMask(ctx, cx, cy, R, fov);
   const toScreen = (fwd, left) => [cx - left * scale, cy - fwd * scale];
   const scan = d.scan;
   if (scan && scan.ranges) {
@@ -139,6 +243,8 @@ function drawRadar(d) {
   });
   ctx.fillStyle = "#e6f0f5";
   ctx.beginPath(); ctx.moveTo(cx, cy - 7); ctx.lineTo(cx - 5, cy + 6); ctx.lineTo(cx + 5, cy + 6); ctx.closePath(); ctx.fill();
+
+  drawFovFront(ctx, cx, cy, R, fov);
 
   const av = d.avoidance || {};
   $("radar-title").textContent = (d.source || "SIM") + " · avoid";
@@ -194,6 +300,9 @@ function initMap() {
   layers.sat.addTo(map);
   trailLine = L.polyline([], { color: "#38e07b", weight: 2, opacity: 0.8 }).addTo(map);
   wpLine = L.polyline([], { color: "#22d3ee", weight: 1.5, dashArray: "5,5" }).addTo(map);
+  // The delivery route is drawn separately from the editable mission line so a
+  // Firebase order is visually distinct from waypoints someone dropped by hand.
+  dlvRouteLine = L.polyline([], { color: "#22d3ee", weight: 2.5, opacity: 0.9 }).addTo(map);
   const arrow = L.divIcon({ className: "drone-icon", html: '<span class="drone-rot">▲</span>', iconSize: [20, 20] });
   droneMarker = L.marker([12.9017, 77.654], { icon: arrow }).addTo(map);
 
@@ -203,7 +312,10 @@ function initMap() {
     document.querySelectorAll(".lyr").forEach((x) => x.classList.remove("on"));
     b.classList.add("on");
   });
-  map.on("mousemove", (e) => $("coord-cursor").textContent = `${e.latlng.lat.toFixed(6)}, ${e.latlng.lng.toFixed(6)}`);
+  map.on("mousemove", (e) => {
+    cursorLatLng = e.latlng;
+    $("coord-cursor").textContent = `${e.latlng.lat.toFixed(6)}, ${e.latlng.lng.toFixed(6)}`;
+  });
   map.on("click", (e) => { if (wpMode) addLocalWp(e.latlng.lat, e.latlng.lng); });
   $("tb-wp").onclick = () => { wpMode = !wpMode; $("tb-wp").classList.toggle("on", wpMode); };
   $("tb-clear").onclick = () => { localWps = []; renderWps(); send("clear_mission"); };
@@ -212,7 +324,7 @@ function initMap() {
   $("ms-save").onclick = downloadPlan;
   $("ms-load").onclick = () => $("plan-file").click();
 }
-function addLocalWp(lat, lon) { localWps.push({ lat, lon, alt: 5 }); renderWps(); uploadMission(); }
+function addLocalWp(lat, lon) { localWps.push({ lat, lon, alt: 3 }); renderWps(); uploadMission(); }
 function renderWps() {
   wpMarkers.forEach((m) => map.removeLayer(m));
   wpMarkers = [];
@@ -252,6 +364,320 @@ function updateMap(d) {
     renderWps(); seeded = true;
   }
 }
+/* ---------- delivery (Firebase order -> flight) ----------------------------
+   Everything here is a read-out of the delivery node's published state: the
+   browser holds no delivery state of its own, so a reload or a second operator
+   opening the dashboard sees exactly the same thing. The only outbound calls
+   are the four operator decisions (accept / decline / abort / auto-accept).   */
+const DLV_LABEL = {
+  IDLE: "IDLE", PENDING: "ORDER PENDING", REJECTED: "REJECTED",
+  ACCEPTED: "ACCEPTED", ENROUTE: "EN ROUTE", HOVERING: "HOVERING",
+  RETURNING: "RETURNING", LANDED: "DELIVERED", ABORTED: "ABORTED",
+};
+const DLV_TOAST = {
+  PENDING: ["NEW DELIVERY ORDER", "amber"],
+  ACCEPTED: ["ORDER ACCEPTED — LAUNCHING", "ok"],
+  ENROUTE: ["EN ROUTE TO DROP POINT", "ok"],
+  HOVERING: ["HOLDING OVER DROP POINT", "ok"],
+  RETURNING: ["RETURNING HOME", "amber"],
+  LANDED: ["DELIVERY COMPLETE", "ok"],
+  REJECTED: ["ORDER REJECTED", "bad"],
+  ABORTED: ["DELIVERY ABORTED", "bad"],
+};
+
+/* The flight, as six steps. The timeline is the fastest way to answer "where
+   is my order right now" without reading any numbers. */
+const DLV_STEPS = ["ORDER", "LAUNCH", "EN ROUTE", "HOVER", "RETURN", "HOME"];
+const DLV_STEP_OF = {
+  IDLE: -1, PENDING: 0, REJECTED: 0, ACCEPTED: 1,
+  ENROUTE: 2, HOVERING: 3, RETURNING: 4, LANDED: 5, ABORTED: -2,
+};
+
+function dlvAge(iso) {
+  if (!iso) return "";
+  const t = Date.parse(iso);
+  if (isNaN(t)) return "";
+  const s = Math.max(0, (Date.now() - t) / 1000);
+  if (s < 60) return Math.round(s) + "s ago";
+  if (s < 3600) return Math.round(s / 60) + "m ago";
+  if (s < 86400) return Math.round(s / 3600) + "h ago";
+  return Math.round(s / 86400) + "d ago";
+}
+
+function dlvEta(v, phase, groundSpeed) {
+  // Hover time is known exactly; flight time is only ever an estimate, so it
+  // is shown as one rather than dressed up with false precision.
+  if (phase === "HOVERING") return fmt(v.hover_remaining_s, 0) + " s hold";
+  if (!["ENROUTE", "RETURNING", "ACCEPTED"].includes(phase)) return "--";
+  const remaining = v.remaining_m || 0;
+  if (!remaining) return "--";
+  const speed = groundSpeed > 0.6 ? groundSpeed : 4.0;   // cruise fallback
+  let secs = remaining / speed;
+  if (phase === "ENROUTE" || phase === "ACCEPTED") secs += (v.hover_seconds || 0);
+  return "~" + (secs < 90 ? Math.round(secs) + " s" : Math.round(secs / 60) + " min");
+}
+
+function dlvTrack(phase) {
+  const at = DLV_STEP_OF[phase] === undefined ? -1 : DLV_STEP_OF[phase];
+  const aborted = at === -2;
+  const bars = DLV_STEPS.map(function (_, i) {
+    let cls = "dlv-step";
+    if (aborted) cls += i === 0 ? " bad" : "";
+    else if (at > i) cls += " done";
+    else if (at === i) cls += " on";
+    return '<div class="' + cls + '"></div>';
+  }).join("");
+  return '<div style="display:flex;gap:3px">' + bars + '</div>'
+    + '<div class="dlv-track-labels">'
+    + DLV_STEPS.map(function (l) { return "<span>" + l + "</span>"; }).join("")
+    + '</div>';
+}
+
+function dlvRow(o, selected) {
+  // A row is only clickable when the drone could actually fly it; a blocked
+  // order still shows, with the reason, rather than being hidden.
+  const cls = o.flown ? "done" : (o.dispatchable ? (selected ? "sel" : "") : "blocked");
+  const who = o.recipient_id ? " · " + o.recipient_id : "";
+  const coords = Number(o.target_lat).toFixed(5) + ", " + Number(o.target_lon).toFixed(5);
+  const sub = o.blocked_reason
+    ? o.blocked_reason
+    : coords + (o.created_at ? " · " + dlvAge(o.created_at) : "");
+  const pick = o.dispatchable && !o.flown ? o.order_id : "";
+  return '<div class="dlv-row ' + cls + '" data-order="' + pick + '">'
+    + '<span class="dlv-row-id">#' + String(o.order_id).slice(0, 14) + who + '</span>'
+    + '<span class="dlv-row-dist">' + (o.distance_m ? fmt(o.distance_m, 0) + " m" : "") + '</span>'
+    + '<span class="dlv-row-sub">' + sub + '</span>'
+    + '</div>';
+}
+
+function updateDelivery(d) {
+  const v = d.delivery || {};
+  const phase = v.phase || "IDLE";
+  const lower = phase.toLowerCase();
+  const pending = phase === "PENDING";
+  const inFlight = ["ACCEPTED", "ENROUTE", "HOVERING", "RETURNING"].includes(phase);
+  const orders = v.orders || [], recent = v.recent || [];
+
+  const badge = $("dlv-phase");
+  if (badge) { badge.textContent = DLV_LABEL[phase] || phase; badge.className = "dlv-badge " + lower; }
+  const hd = $("dlv-hd-phase");
+  if (hd) hd.textContent = DLV_LABEL[phase] || phase;
+  const link = $("dlv-link");
+  if (link) { link.className = "link-dot " + (v.link || "disabled"); link.title = "order source: " + (v.link || "disabled"); }
+
+  const count = $("dlv-count");
+  if (count) {
+    count.textContent = orders.length;
+    count.classList.toggle("has", orders.length > 0);
+    count.title = orders.length + " order(s) awaiting dispatch";
+  }
+
+  // Setup banner: the one thing that stops orders reaching the drone at all.
+  const setup = $("dlv-setup");
+  if (setup) {
+    const broken = ["no-credentials", "error"].includes(v.link);
+    setup.classList.toggle("on", broken);
+    if (broken) {
+      setup.innerHTML = v.link === "no-credentials"
+        ? "Orders from the app cannot be read yet.<br>Install the Firebase key: "
+          + "<code>scripts/firebase_setup.py &lt;key.json&gt;</code>"
+        : "Order source error: " + (v.last_error || "unknown");
+    }
+  }
+
+  // Inbox: every order the app has placed that the drone could still fly.
+  const inbox = $("dlv-inbox");
+  if (inbox) {
+    const rows = orders.map(function (o) {
+      return dlvRow(o, o.order_id === v.selected_order_id);
+    });
+    inbox.innerHTML = rows.length
+      ? rows.join("")
+      : (v.link === "online"
+          ? '<div class="dlv-empty">No orders waiting. Place one in the app.</div>'
+          : "");
+  }
+
+  $("dlv-order").textContent = v.order_id ? "#" + v.order_id : "no order";
+  $("dlv-msg").textContent = v.message || "--";
+  $("dlv-track").innerHTML = dlvTrack(phase);
+  $("dlv-target").textContent = (v.target_lat || v.target_lon)
+    ? Number(v.target_lat).toFixed(5) + ", " + Number(v.target_lon).toFixed(5) : "--";
+  $("dlv-dist").textContent = v.distance_m ? fmt(v.remaining_m || v.distance_m, 0) + " m" : "--";
+  $("dlv-wps").textContent = v.waypoints
+    ? v.waypoints + (v.fc_mission_uploaded ? " ✓FC" : "") : "--";
+  $("dlv-hover").textContent = phase === "HOVERING"
+    ? fmt(v.hover_remaining_s, 0) + " s left"
+    : (v.hover_seconds ? fmt(v.hover_seconds, 0) + " s" : "--");
+  $("dlv-eta").textContent = dlvEta(v, phase, (d.telemetry || {}).ground_speed || 0);
+
+  // Progress bar: the hover countdown while holding, distance covered while flying.
+  const wrap = $("dlv-bar-wrap"), bar = $("dlv-bar");
+  if (wrap && bar) {
+    let pct = null;
+    if (phase === "HOVERING" && v.hover_seconds > 0) {
+      pct = 100 * (1 - (v.hover_remaining_s / v.hover_seconds));
+    } else if (["ENROUTE", "RETURNING"].includes(phase) && v.distance_m > 0) {
+      pct = 100 * (1 - Math.min(1, (v.remaining_m || 0) / v.distance_m));
+    }
+    wrap.classList.toggle("on", pct !== null);
+    if (pct !== null) bar.style.width = Math.max(0, Math.min(100, pct)).toFixed(1) + "%";
+  }
+
+  $("dlv-accept").disabled = !pending;
+  $("dlv-reject").disabled = !pending;
+  $("dlv-abort").disabled = !inFlight;
+  $("dlv-auto").classList.toggle("on", !!v.auto_accept);
+
+  updateOrderBook(v, orders, recent, phase);
+  updateDeliveryMap(d, v, phase);
+
+  if (lastDlvPhase === null) { lastDlvPhase = phase; return; }   // don't toast on load
+  if (phase !== lastDlvPhase) {
+    lastDlvPhase = phase;
+    const t = DLV_TOAST[phase];
+    if (t) showToast(t[0], t[1]);
+  }
+}
+
+/* The bottom panel is the audit view: every order the app has written, queued
+   and historical, so "did my order arrive" is answerable at a glance. */
+function updateOrderBook(v, orders, recent, phase) {
+  const book = $("dlv-book");
+  if (!book) return;
+  $("tbl-delivery").innerHTML = "";
+  const all = orders.concat(recent);
+  if (!all.length) {
+    book.innerHTML = '<div class="dlv-empty">'
+      + (v.link === "online"
+          ? "No orders in Firebase yet."
+          : "Order source offline — " + (v.last_error || v.link))
+      + '</div>';
+    return;
+  }
+  const rows = all.map(function (o) {
+    const live = o.order_id === v.order_id && phase !== "IDLE";
+    const status = live ? "flying" : String(o.status || "").toLowerCase();
+    const label = live ? (DLV_LABEL[phase] || phase) : (o.status || "--");
+    const pick = o.dispatchable && !o.flown;
+    // Repeat: re-fly the exact same drop point. Only offered once an order
+    // is done with (not live, not already sitting in the dispatch queue) -
+    // it re-injects a fresh order_id at the same lat/lon, which still has to
+    // go through ACCEPT & FLY like any other order, so this cannot launch
+    // anything by itself.
+    const canRepeat = !live && !pick && o.target_lat && o.target_lon;
+    const repeatBtn = canRepeat
+      ? '<button class="repeat-btn" data-repeat="1" data-repeat-id="' + o.order_id
+        + '" data-repeat-lat="' + o.target_lat + '" data-repeat-lon="' + o.target_lon
+        + '" title="Fly this same drop point again">↻ Repeat</button>'
+      : "";
+    return '<tr class="' + (live ? "live " : "") + (pick ? "pick" : "") + '"'
+      + ' data-order="' + (pick ? o.order_id : "") + '">'
+      + "<td>#" + String(o.order_id).slice(0, 12) + "</td>"
+      + "<td>" + (o.recipient_id || "--") + "</td>"
+      + "<td>" + Number(o.target_lat).toFixed(5) + ", " + Number(o.target_lon).toFixed(5) + "</td>"
+      + "<td>" + (o.distance_m ? fmt(o.distance_m, 0) + " m" : "--") + "</td>"
+      + "<td>" + (dlvAge(o.created_at) || "--") + "</td>"
+      + '<td><span class="pill ' + status + '">' + label + "</span></td>"
+      + "<td>" + repeatBtn + "</td>"
+      + "</tr>";
+  }).join("");
+  book.innerHTML = "<table><thead><tr>"
+    + "<th>Order</th><th>Recipient</th><th>Target</th><th>Dist</th><th>Placed</th><th>Status</th><th></th>"
+    + "</tr></thead><tbody>" + rows + "</tbody></table>";
+}
+
+function updateDeliveryMap(d, v, phase) {
+  const hasTarget = (v.target_lat || v.target_lon)
+    && ["PENDING", "ACCEPTED", "ENROUTE", "HOVERING", "RETURNING"].includes(phase);
+  if (!hasTarget) {
+    if (dlvTargetMarker) { map.removeLayer(dlvTargetMarker); dlvTargetMarker = null; }
+    if (dlvRouteLine) dlvRouteLine.setLatLngs([]);
+    return;
+  }
+  const ll = [v.target_lat, v.target_lon];
+  const icon = L.divIcon({
+    className: "",
+    html: `<div class="dlv-target-icon ${phase === "HOVERING" ? "hovering" : ""}">◎</div>`,
+    iconSize: [22, 22], iconAnchor: [11, 11],
+  });
+  if (!dlvTargetMarker) {
+    dlvTargetMarker = L.marker(ll, { icon }).addTo(map);
+  } else {
+    dlvTargetMarker.setLatLng(ll); dlvTargetMarker.setIcon(icon);
+  }
+  dlvTargetMarker.bindTooltip(
+    `DROP POINT${v.order_id ? " · #" + v.order_id : ""}`, { permanent: false });
+
+  // Draw from wherever the aircraft actually is, so the line shrinks as it flies.
+  const p = d.position || {};
+  if (p.lat && p.lon) dlvRouteLine.setLatLngs([[p.lat, p.lon], ll]);
+  else dlvRouteLine.setLatLngs([ll]);
+}
+
+function initDelivery() {
+  $("dlv-accept").onclick = () => {
+    const v = (latest.delivery || {});
+    confirmDanger("ACCEPT DELIVERY & FLY?",
+      `The drone will arm, take off, fly ${fmt(v.distance_m, 0)} m to the drop point, `
+      + `hold for ${fmt(v.hover_seconds, 0)} s and return home. Ensure the area is clear.`,
+      () => send("delivery_accept", { order_id: v.order_id || "" }));
+  };
+  $("dlv-reject").onclick = () => send("delivery_reject", { reason: "declined by operator" });
+  $("dlv-abort").onclick = () => confirmDanger("ABORT DELIVERY?",
+    "The drone will stop the delivery and return home immediately.",
+    () => send("delivery_abort"));
+  $("dlv-auto").onclick = () => {
+    const on = !!(latest.delivery || {}).auto_accept;
+    if (on) { send("delivery_set_auto", { enabled: false }); return; }
+    confirmDanger("ENABLE AUTO-ACCEPT?",
+      "Every new order will be flown WITHOUT asking. The drone can arm and take "
+      + "off on its own from this point on.",
+      () => send("delivery_set_auto", { enabled: true }));
+  };
+  // Test order: drops an order at the map cursor without touching Firebase, so
+  // the whole chain can be demonstrated with no app and no credentials.
+  $("dlv-inject").onclick = () => {
+    if (!cursorLatLng) { showToast("MOVE THE CURSOR OVER THE MAP FIRST", "amber"); return; }
+    const { lat, lng } = cursorLatLng;
+    send("delivery_inject", { lat, lon: lng, order_id: "test-" + Date.now() });
+  };
+
+  // Ask Firebase now rather than waiting out the poll interval - the first
+  // thing anyone does after placing an order in the app is look here.
+  const refresh = $("dlv-refresh");
+  if (refresh) refresh.onclick = () => {
+    refresh.classList.add("spin");
+    setTimeout(() => refresh.classList.remove("spin"), 600);
+    send("delivery_refresh");
+  };
+
+  // Picking an order out of the queue. Delegated, because the rows are
+  // re-rendered on every frame and per-row handlers would not survive.
+  // Selecting only moves the offer; flying still needs ACCEPT & FLY.
+  const pick = (ev) => {
+    const repeatBtn = ev.target.closest("[data-repeat]");
+    if (repeatBtn) {
+      const lat = parseFloat(repeatBtn.getAttribute("data-repeat-lat"));
+      const lon = parseFloat(repeatBtn.getAttribute("data-repeat-lon"));
+      if (isNaN(lat) || isNaN(lon)) return;
+      send("delivery_inject", {
+        lat, lon,
+        order_id: "repeat-" + repeatBtn.getAttribute("data-repeat-id") + "-" + Date.now(),
+      });
+      showToast("REPEAT ORDER QUEUED · same drop point · ACCEPT & FLY to launch", "good");
+      return;
+    }
+    const row = ev.target.closest("[data-order]");
+    if (!row) return;
+    const id = row.getAttribute("data-order");
+    if (!id) return;
+    send("delivery_select", { order_id: id });
+  };
+  const inbox = $("dlv-inbox"); if (inbox) inbox.onclick = pick;
+  const book = $("dlv-book");   if (book) book.onclick = pick;
+}
+
 function downloadPlan() {
   fetch("/api/mission/plan").then((r) => r.json()).then((plan) => {
     const blob = new Blob([JSON.stringify(plan, null, 2)], { type: "application/json" });
@@ -276,8 +702,16 @@ $("plan-file") && ($("plan-file").onchange = (e) => {
 function kv(rows) { return rows.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join(""); }
 function updatePanels(d) {
   const t = d.telemetry || {}, av = d.avoidance || {}, m = d.mission || {}, h = d.health || {};
+  // Transmitter link. The navigator stands down the moment the pilot moves the
+  // mode switch, so whether that switch can reach the aircraft is worth seeing
+  // on the ground, not discovering in the air.
+  const rc = d.rc || {};
+  const rcTxt = rc.connected
+    ? `<span class="pill good">LINKED</span> ${rc.count || 0} ch`
+    : '<span class="pill bad">NO RC</span>';
   $("tbl-telem").innerHTML = kv([
     ["Flight Mode", t.flight_mode], ["Armed", t.armed ? "YES" : "no"],
+    ["Transmitter", rcTxt],
     ["GPS Fix", t.gps_fix], ["Satellites", t.satellites],
     ["Altitude", fmt(t.altitude, 1) + " m"], ["Ground Spd", fmt(t.ground_speed, 1) + " m/s"],
     ["Vert Spd", fmt(t.vert_speed, 1) + " m/s"], ["Heading", fmt(t.heading, 0) + "°"],
@@ -290,10 +724,47 @@ function updatePanels(d) {
     ["TTC", fmt(av.ttc_s, 2) + " s"], ["CPA", fmt(av.cpa_m, 2) + " m"],
     ["Command", av.command], ["Reason", av.reason || "--"],
   ]);
-  $("tbl-mission").innerHTML = kv([
+  // Altitude hardlock + who is flying. Shown on every frame: during real
+  // flight the operator needs to see the limit and the override state without
+  // having to infer them from the aircraft's behaviour.
+  const ceil = Number(m.alt_ceiling_m) || 0;
+  const altNow = Number(t.altitude) || 0;
+  const lockTxt = ceil
+    ? `${fmt(altNow, 2)} m / ${fmt(ceil, 1)} m ceiling`
+    : "--";
+  const lockCls = ceil && altNow > ceil + 0.05 ? "bad"
+                : ceil && altNow > ceil * 0.85 ? "warn" : "good";
+  const rows = [
     ["Phase", m.phase], ["Waypoint", `${m.current_wp}/${m.total_wp}`],
+    ["Altitude", `<span class="pill ${lockCls}">${lockTxt}</span>`],
+    ["Control", m.pilot_override
+      ? '<span class="pill bad">PILOT (transmitter)</span>'
+      : '<span class="pill good">AUTO (ground station)</span>'],
     ["Avoiding", m.avoiding ? "yes" : "no"], ["Status", m.message || "--"],
-  ]);
+  ];
+  if (m.arm_refusal) rows.push(["Autopilot", `<span class="pill warn">${m.arm_refusal}</span>`]);
+  $("tbl-mission").innerHTML = kv(rows);
+
+  // The override is latched until a human clears it, so make the way out
+  // impossible to miss: highlight RESUME for exactly as long as it is the
+  // thing standing between the operator and a flyable aircraft.
+  const resumeBtn = $("btn-resume");
+  if (resumeBtn) {
+    resumeBtn.classList.toggle("amber", !!m.pilot_override);
+    resumeBtn.textContent = m.pilot_override
+      ? "RESUME · TAKE BACK CONTROL"
+      : "RESUME";
+  }
+
+  if (m.pilot_override !== lastOverride) {
+    if (lastOverride !== null) {
+      showToast(m.pilot_override
+        ? "PILOT OVERRIDE · transmitter has control · press RESUME to fly again"
+        : "AUTO · ground station has control",
+        m.pilot_override ? "warn" : "good");
+    }
+    lastOverride = m.pilot_override;
+  }
   $("tbl-health").innerHTML = kv([
     ["CPU", fmt(h.cpu, 0) + " %"], ["RAM", fmt(h.ram, 0) + " %"],
     ["Temp", fmt(h.temp, 0) + " °C"], ["LIDAR FPS", fmt(h.lidar_fps, 1)],
@@ -463,7 +934,7 @@ function saveScan() {
 
 /* ---------- render ---------- */
 function render(d) {
-  updateHeader(d); drawRadar(d); updateMap(d); updatePanels(d);
+  updateHeader(d); drawRadar(d); updateMap(d); updatePanels(d); updateDelivery(d);
   updateSparks(d); updateConsole(d);
   updateCam(0, (d.cameras || [])[0]); updateCam(1, (d.cameras || [])[1]);
 }
@@ -496,6 +967,16 @@ function wire() {
     else if (e.key === "ArrowUp") { e.preventDefault(); nlHistoryNav(-1); }
     else if (e.key === "ArrowDown") { e.preventDefault(); nlHistoryNav(1); }
   });
+  // "AUTO MODE · READY FOR NEXT MISSION": one click = clear a latched
+  // transmitter takeover (resume) + a stuck delivery-in-progress flag
+  // (delivery_reset, itself gated to a disarmed aircraft server-side, so
+  // this can never interrupt a real flight). Replaces "restart the Pi" as
+  // the way back to flyable after an override, an abort, or a finish.
+  $("btn-auto-mode").onclick = () => {
+    send("resume");
+    send("delivery_reset");
+    showToast("AUTO MODE · clearing takeover + delivery state", "good");
+  };
   $("src-sim").onclick = () => send("set_source", { mode: "sim" });
   $("src-real").onclick = () => confirmDanger("SWITCH TO REAL MODE?",
     "Commands will control the PHYSICAL drone (Pixhawk + LIDAR). Simulation safety is disabled.",
@@ -536,5 +1017,5 @@ function wire() {
 
 window.addEventListener("DOMContentLoaded", () => {
   initTheme(); buildModeGrid(); initMap(); buildSparks(); setupRadarControls();
-  wire(); initCams(); loadLogList(); connect();
+  wire(); initDelivery(); initCams(); loadLogList(); connect();
 });

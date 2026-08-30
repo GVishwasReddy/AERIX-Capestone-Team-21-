@@ -21,21 +21,262 @@ mavlink:
   baud: 115200
 
 lidar:
-  # RPLIDAR C1 over USB usually enumerates as /dev/ttyUSB0.
-  port: "/dev/ttyUSB0"
+  # Re-enabled 2026-08-29: the RPLIDAR USB adapter enumerates cleanly again
+  # (verified in /dev/serial/by-id/ and with a live standalone scan test,
+  # 360-bin scans at ~10 Hz, no over-current events in dmesg). The
+  # 2026-08-27 "not enumerating" issue was a transient USB/cable state, not
+  # a config or driver problem.
+  enabled: true
+  # RPLIDAR C1. Use the stable by-id path, never /dev/ttyUSB0: any USB bus
+  # reset re-enumerates the CP2102N (ttyUSB0 -> ttyUSB1 -> ttyUSB2) and a
+  # hardcoded number then fails to open forever.
+  port: "/dev/serial/by-id/usb-Silicon_Labs_CP2102N_USB_to_UART_Bridge_Controller_3e8e15cb1664ef11b066daa9c169b110-if00-port0"
   baud: 460800
+  # RPLIDAR C1 numbers its beams clockwise; the stack is counter-clockwise.
+  # Without this the whole scan is mirrored left/right (fixed 2026-08-29).
+  clockwise: true
+  # Front reference: 0 deg is the LiDAR face aimed at the nose. Re-measure
+  # angle_offset_deg (the RAW clockwise angle pointing at the nose) if the
+  # unit is ever remounted - the whole 270 deg window and the GCS front line
+  # are drawn from it.
+  angle_offset_deg: 0.0
+  # 125 deg left + 125 deg right = 250 deg scanned; the 110 deg directly
+  # behind is ignored (airframe + ground clutter the drone is parked in).
+  #
+  # Narrowed from 270 on 2026-08-29 after the first manual flight. 270 ran the
+  # window right up to where the airframe's own clutter starts, so anything
+  # that moved a few degrees - a remount, a flexing arm, an object sitting on
+  # the boundary - fed returns straight back into avoidance. The extra 20 deg
+  # is grace, not a capability loss: nothing useful lives at 125-135 deg off
+  # the nose on this aircraft.
+  fov_enabled: true
+  fov_deg: 250.0
+
+# Obstacle avoidance for MANUAL flight. The Pi streams the 270 deg scan to
+# the Pixhawk as OBSTACLE_DISTANCE and ArduPilot limits the pilot's own stick
+# demand - the aircraft simply will not fly closer than AVOID_MARGIN. Yaw is
+# untouched: simple avoidance only limits horizontal velocity, and OA_TYPE=0
+# keeps the path planner (which does re-aim the aircraft) out of it.
+#
+# Fly in LOITER or POSHOLD. STABILIZE and ACRO have no velocity controller for
+# avoidance to limit, so they get none.
+#
+# Required on the FC, or this stream is ignored:
+#   PRX1_TYPE 2   AVOID_ENABLE 2   AVOID_BEHAVE 1   AVOID_MARGIN 2
+#   AVOID_DIST_MAX 5   OA_TYPE 0
+proximity:
+  enabled: true
+  rate_hz: 10
+  # Raised from 0.15: below this is the airframe itself and prop wash, not
+  # obstacles, and those returns were reaching the FC as walls.
+  min_distance_m: 0.30
+  max_distance_m: 12.0
+  # Noise gates, added after the first manual flight made the aircraft
+  # oscillate. min_points: a 5 deg sector needs this many returns before it
+  # reports, and the Nth closest sets the distance - so one stray beam cannot
+  # fake a wall. filter_depth: each sector is the median of this many
+  # revolutions, so a one-frame spike is discarded rather than flown at.
+  # Raise either if it still twitches; lower them if it reacts too late.
+  min_points: 2
+  filter_depth: 3
+  # Asymmetric filtering: a sector two consecutive revolutions agree has closed
+  # in is published at once instead of waiting to win the median, while
+  # anything receding is still smoothed. Cuts a revolution off the reaction to
+  # a real obstacle without re-admitting the single-beam spikes that made the
+  # aircraft oscillate - one frame on its own is still rejected.
+  fast_approach: true
+
+# Frame-to-frame obstacle tracking. Without this an obstacle's identity is its
+# index in a distance-sorted list, rebuilt every revolution, so nothing could
+# tell that the cluster 2 m ahead is the one that was 3 m ahead a moment ago -
+# which is why avoidance only ever reacted to stationary things.
+obstacles:
+  tracking:
+    enabled: true
+    # Association radius. At 10 Hz this also caps the fastest apparent motion
+    # the tracker will believe: 0.7 m per revolution is 7 m/s. Tightened from
+    # 1.2 on 2026-08-30 after a bench run reported stationary room clutter
+    # "moving" at 4.7-5.4 m/s - a loose gate lets a cluster that split between
+    # revolutions match the wrong half, and the centroid jump differentiates
+    # into a large false velocity.
+    gate_m: 0.7
+    # Revolutions a track survives unmatched before it is dropped. The LiDAR
+    # loses returns off dark or oblique surfaces for a frame at a time; killing
+    # a track on the first miss would throw away its velocity.
+    max_misses: 3
+    # Matches before a velocity is published. One frame gives position only.
+    min_hits: 2
+    # Smoothing on the differentiated velocity - light, because this is the
+    # signal that is supposed to be fast.
+    alpha: 0.5
+    # Own-speed threshold above which an object counts as moving. Below this it
+    # is noise in the ego-motion estimate, not a pedestrian.
+    dynamic_speed_ms: 0.5
+    # Consecutive revolutions a track must measure as moving before it is
+    # called dynamic. A pedestrian keeps moving; a cluster that split for one
+    # frame flickers, so consecutive agreement rejects the artefact. At 10 Hz
+    # this costs 0.3 s on a real moving object.
+    dynamic_min_hits: 3
+    # Sanity ceiling. Nothing this aircraft avoids at 1 m/s in a delivery yard
+    # moves faster than this; a larger number is evidence two different objects
+    # were matched to one track, and acting on it would brake for nothing.
+    max_speed_ms: 6.0
 
 web:
   enabled: true
   port: 8090
 
 safety:
-  # TEMPORARY (bench testing): the GCS auto-failsafe kept triggering a
-  # geofence/link RTL that the FC refuses without a GPS position estimate.
-  # Set false so the GCS stops commanding RTL while you test on the bench.
-  # Re-enable (true) before real flights.
+  # Auto-failsafes ON for real flight (battery -> LAND/RTL, link loss -> RTL,
+  # geofence -> RTL). These were set false for bench testing, when the GCS kept
+  # commanding an RTL the FC refused for want of a position estimate; with a 3D
+  # fix and home latched that does not happen. Set false ONLY for bench runs.
+  #
+  # The 3 m altitude hardlock does NOT depend on this switch - NavigationNode
+  # checks the ceiling ahead of it, so the lock stays armed either way.
   failsafes_enabled: false
   # 6S LiPo (CNHL 6S 4000mAh) thresholds — the defaults were 4S (14V).
   battery_low_voltage: 21.6       # 3.6 V/cell -> warn
   battery_critical_voltage: 20.4  # 3.4 V/cell -> land
   min_satellites: 6
+  # Standard operating ceiling for delivery test flights. Every commanded
+  # altitude is clamped to this by NavigationNode._clamp_alt; the hardlock
+  # brakes only on an UNcommanded climb past this + altitude_margin_m.
+  max_altitude_m: 3.0
+
+delivery:
+  enabled: true
+  source: firestore
+  # Real flight: a human presses "ACCEPT & FLY" on the GCS. Never auto-arm off
+  # a database row.
+  auto_accept: false
+  upload_to_fc: true
+  write_back: true
+  # Ceiling for the drop-point hold. Extended from 5.0 -> 23.0 -> 30.0
+  # (2026-08-27) to give drone_ble_peripheral.py's handshake+geofence+drop
+  # exchange with the recipient's phone time to complete before the hard
+  # timeout RTL. If the handshake finishes earlier, NavigationNode cuts the
+  # hold short instead of waiting out the full 30s - see
+  # ble_early_rtl_enabled/_wait_s below.
+  hover_seconds: 30.0
+  hover_altitude_m: 3.0
+  # GUIDED, never POSHOLD/LOITER. Those take their ALTITUDE from the pilot's
+  # throttle stick, which sits at RC3_MIN through an autonomous delivery -
+  # ArduPilot reads that as "descend at the full pilot rate". Flights on
+  # 2026-08-25 (dataflash 453/454) held 3.5 m steady in GUIDED and then fell
+  # at 2.4 m/s within 0.35 s of the switch into POSHOLD, hitting the ground
+  # still descending and breaking the landing gear. NavigationNode now refuses
+  # a stick-driven hover mode outright; this is here so the config agrees.
+  hover_mode: GUIDED
+  # How far the aircraft may sag below hover_altitude_m before the navigator
+  # re-asserts the hold rather than watching it descend.
+  hover_alt_tolerance_m: 1.0
+  # RTL, not SMART_RTL (changed 2026-08-30). ArduPilot's object-avoidance path
+  # planning covers AUTO, GUIDED and RTL - it does NOT cover SMART_RTL, and the
+  # GCS cannot inject avoidance into an FC-run mode without seizing it, which is
+  # the mechanism behind the 2026-08-22 lockout. SMART_RTL would therefore fly
+  # the whole return leg with no avoidance at all.
+  #
+  # The trade: RTL cuts a straight line home at RTL_ALT instead of retracing the
+  # outbound path, so it can cross ground the aircraft has not already flown -
+  # but it crosses it with avoidance live, which SMART_RTL cannot.
+  return_mode: RTL
+
+navigation:
+  # 3 m standard profile: climb to 3 m, hold 2 s, run the leg, hold at the
+  # drop point, SMART_RTL home. Kept at/below safety.max_altitude_m so
+  # _clamp_alt is a no-op on these rather than silently trimming them.
+  takeoff_altitude_m: 3.0
+  cruise_altitude_m: 3.0
+  takeoff_settle_s: 2.0
+  # Acceptance radius: how close counts as "reached". Tightened 1.5 -> 1.0
+  # for small test areas. This is a PRECISION requirement, not a distance
+  # budget - the drone must get within 1 m of the point before the mission
+  # advances, so it needs a good fix to ever register arrival.
+  waypoint_radius_m: 1.0
+  # Cruise speed for autonomous legs. 1.0 m/s deliberately: the LiDAR turns at
+  # ~9.6 Hz (measured), so at this speed the aircraft covers ~10 cm between
+  # revolutions. Faster and obstacles arrive in fewer scans than the noise
+  # gates need to confirm them. This is the GCS-side number - WPNAV_SPEED on
+  # the FC has to agree, because GUIDED goto speed is the autopilot's.
+  cruise_speed_ms: 1.0
+  # Obstacle avoidance ON (2026-08-30). This is the GCS reactive layer; the FC
+  # runs its own (AVOID_ENABLE in Loiter, OA_TYPE in Guided/RTL) and the two are
+  # deliberately layered - the FC leg survives a Pi or Wi-Fi dropout, the GCS
+  # leg adds the dynamic-obstacle tracking ArduPilot's static obstacle database
+  # handles poorly.
+  avoidance_enabled: true
+  # Reactive sector dodge (see default.yaml). Side cones are clamped to
+  # lidar.fov_deg/2 = 125 deg, so they cover exactly the scanned window and
+  # nothing is ever read as "clear" out of the masked rear 90 deg. With the
+  # rear unmeasured there is no reverse escape: front + both sides blocked
+  # brakes and holds rather than backing into the clutter the mask exists for.
+  # Conservative for a 3 m test profile - retune against the Tarot 650's real
+  # stopping distance before relying on it.
+  # Stand-off, measured from the LiDAR (the OBSTACLE_DISTANCE stream carries
+  # raw LiDAR ranges, so 1.0 here means "1 m as the LiDAR reads it"). Tight for
+  # a Tarot 650: the frame is ~0.33 m in radius, so 1 m of LiDAR range is
+  # roughly 0.65 m of clear air past the prop tips. Set to match AVOID_MARGIN
+  # on the FC, which is what actually stops the aircraft in manual flight.
+  # HARD BRAKE. Last resort, not the normal way obstacles are dealt with: the
+  # FC's path planner is configured to route around things from ~10 m out with
+  # avoidance_route_margin_m of clearance, so in normal flight this should
+  # never fire. If it is firing regularly, the routing is not working and that
+  # is the thing to fix - not this number.
+  avoidance_stop_m: 1.7
+  # Clearance the FC's path planner (OA_MARGIN_MAX) keeps while routing in
+  # GUIDED/RTL. Deliberately well outside the hard brake so the two never
+  # collide: the route bends around an obstacle long before the aircraft is
+  # close enough to need stopping. NavigationNode clamps this to at least
+  # avoidance_stop_m + 0.5 whatever is configured here.
+  #
+  # Trade-off: a wider margin gives smoother, earlier avoidance but makes
+  # BendyRuler more likely to report "no path" in tight spaces. If the test
+  # area has gaps narrower than ~2x this, lower it.
+  avoidance_route_margin_m: 3.0
+  # Where the Pi starts easing off the throttle. Raised 3.0 -> 5.0 so the
+  # aircraft is already slowing while the planner is bending, which gives the
+  # route more time to develop and keeps the deviation small.
+  avoidance_distance_m: 5.0
+  avoidance_front_half_deg: 50.0
+  avoidance_side_half_deg: 125.0
+  # Pi-side reactive sidestep OFF (2026-08-30). Routing is now the flight
+  # controller's job - BendyRuler probes ~10 m ahead and bends the path early,
+  # which is smoother than anything a 10 Hz reactive dodge can do and survives
+  # a Pi or Wi-Fi dropout.
+  #
+  # Two things steering at once is worse than one: the dodge commands a
+  # velocity setpoint, which REPLACES the guided target the planner is flying,
+  # so a dodge firing mid-manoeuvre would tear up the route the FC had already
+  # worked out. With the dodge off, the Pi's response at avoidance_stop_m is a
+  # clean emergency brake - which is the correct answer at a distance the
+  # planner should never have let us reach.
+  #
+  # Set true to get the Pi sidestep back (it still works, and is tested).
+  avoidance_dodge_enabled: false
+  avoidance_dodge_speed_ms: 1.0
+  avoidance_dodge_clear_m: 2.5
+  avoidance_dodge_timeout_s: 5.0
+  # Forward speed carried while sidestepping. Fades in only as the front sector
+  # opens up past the brake distance, so a dodge that is still nose-on to the
+  # obstacle stays a pure sidestep. This is what turns "crab sideways forever"
+  # into "go around it".
+  avoidance_dodge_forward_ms: 0.4
+  # How far the dodge may push the aircraft off the straight line to the
+  # waypoint before it gives up and holds. The mission is a delivery, not a
+  # wander: past this it stops, waits for the path to clear, then re-issues the
+  # goto and rejoins the original track.
+  avoidance_max_offtrack_m: 4.0
+  # Closing-speed padding on the brake distance. The stand-off is a distance,
+  # but what matters is stopping before reaching it, and that depends on how
+  # fast the gap shrinks. 1.0 s of closing motion is added to avoidance_stop_m
+  # (capped by avoidance_reaction_max_m), so something walking into the path at
+  # 1.5 m/s triggers the brake at 3.2 m rather than 1.7 m and ends up with the
+  # same real margin as a wall.
+  avoidance_reaction_s: 1.0
+  avoidance_reaction_max_m: 2.0
+
+# Camera feeds for the GCS dashboard. Set false to disable both cameras
+# (saves CPU when no one is watching the live preview).
+cameras:
+  enabled: true

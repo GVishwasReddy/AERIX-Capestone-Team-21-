@@ -20,6 +20,8 @@ from __future__ import annotations
 import logging
 import threading
 from collections import defaultdict
+
+from drone_stack.bus.topics import Topics
 from typing import Any, Callable
 
 Callback = Callable[[Any], None]
@@ -59,9 +61,14 @@ class MessageBus:
 
     # -- publishing ----------------------------------------------------------
     def publish(self, topic: str, message: Any, latch: bool = True) -> None:
-        """Publish *message* to *topic*, delivering it to all subscribers."""
+        """Publish *message* to *topic*, delivering it to all subscribers.
+
+        Command topics (:attr:`Topics.EVENT_TOPICS`) are never latched, whatever
+        *latch* says: replaying an instruction to a late subscriber makes it act
+        on a request that was already carried out. State topics latch as normal.
+        """
         with self._lock:
-            if latch:
+            if latch and topic not in Topics.EVENT_TOPICS:
                 self._latched[topic] = message
             self._publish_counts[topic] += 1
             callbacks = tuple(self._subscribers.get(topic, ()))

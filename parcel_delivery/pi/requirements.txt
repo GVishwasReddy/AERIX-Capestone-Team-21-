@@ -1,0 +1,14 @@
+# Pi-side dependencies for the parcel delivery stack.
+# NOTE: this is a standalone stack, separate from ~/drone_stack's own venv.
+# Always install into a dedicated virtualenv.
+
+mavsdk>=2.0.0
+pymavlink>=2.4.40
+firebase-admin>=6.5.0
+python-dotenv>=1.0.0
+
+# Real hardware only. The RPLIDAR C1 is driven over raw serial by
+# lidar_bridge.RPLidarC1 — the `rplidar` PyPI package does NOT support the C1
+# (its handshake fails with "Descriptor length mismatch"). pyserial is imported
+# lazily, so the rest of the stack and the tests run fine without hardware.
+pyserial>=3.5

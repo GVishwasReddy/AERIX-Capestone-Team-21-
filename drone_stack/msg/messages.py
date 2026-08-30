@@ -44,6 +44,7 @@ class MissionPhase(str, Enum):
     TAKEOFF = "TAKEOFF"
     NAVIGATE = "NAVIGATE"
     AVOID = "AVOID"
+    HOVER = "HOVER"
     HOLD = "HOLD"
     MANUAL = "MANUAL"
     RTL = "RTL"
@@ -51,6 +52,25 @@ class MissionPhase(str, Enum):
     EMERGENCY = "EMERGENCY"
     DISARMED = "DISARMED"
     COMPLETE = "COMPLETE"
+
+
+class DeliveryPhase(str, Enum):
+    """Lifecycle of one Firebase-sourced delivery, as shown on the GCS.
+
+    Deliberately coarser than :class:`MissionPhase`: this is the *order's*
+    story (what the customer and the operator care about), while MissionPhase
+    is the *aircraft's* story. FirebaseDeliveryNode maps one onto the other.
+    """
+
+    IDLE = "IDLE"                    # no order in hand
+    PENDING = "PENDING"              # order pulled, waiting for operator accept
+    REJECTED = "REJECTED"            # failed validation (geofence/alt/no fix)
+    ACCEPTED = "ACCEPTED"            # accepted, mission being expanded
+    ENROUTE = "ENROUTE"              # armed/taking off/flying the outbound legs
+    HOVERING = "HOVERING"            # holding position over the drop point
+    RETURNING = "RETURNING"          # RTL leg back to base
+    LANDED = "LANDED"                # back home, disarmed
+    ABORTED = "ABORTED"              # operator abort or failsafe cut it short
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +192,8 @@ class SystemStatus(Message):
     sensors_enabled: int = 0         # bitmask
     sensors_health: int = 0          # bitmask
     healthy: bool = True
+    amsl_m: float = 0.0              # SYS_STATUS.altitude_amsl
+    terrain_m: float = 0.0           # SYS_STATUS.altitude_terrain
 
 
 @dataclass
@@ -275,6 +297,25 @@ class Obstacle(Message):
     danger: bool = False
     num_points: int = 0
 
+    # --- tracking (ObstacleTracker) -----------------------------------------
+    # `id` above is the per-frame cluster index and changes identity whenever
+    # anything closer appears; `track_id` is stable across revolutions and is
+    # what the fields below are accumulated against.
+    track_id: int = -1               # -1 = not yet tracked
+    #: Rate the gap is closing, m/s, +ve = shrinking. Includes our own motion,
+    #: because that is what stopping distance actually depends on. Available
+    #: from the second revolution a track is seen.
+    closing_ms: float = 0.0
+    #: The object's own velocity over the ground (ENU), ego-motion removed.
+    #: Stays 0.0 when there is no valid FusedState - a guess here would label
+    #: every wall dynamic the moment the aircraft translated.
+    vx_m_s: float = 0.0
+    vy_m_s: float = 0.0
+    speed_m_s: float = 0.0
+    is_dynamic: bool = False
+    age_s: float = 0.0
+    hits: int = 0                    # revolutions this track has been matched
+
 
 @dataclass
 class ObstacleArray(Message):
@@ -303,6 +344,28 @@ class AvoidanceStatus(Message):
     cpa_m: float = 0.0              # closest point of approach (m)
     command: str = "none"
     reason: str = ""
+    # Ego-centric sector clearances driving the reactive dodge. 0.0 means
+    # nothing was detected in that cone (same convention as closest_m).
+    front_m: float = 0.0
+    left_m: float = 0.0
+    right_m: float = 0.0
+    dodge: str = "none"             # left | right | trapped | none
+    rear_blind: bool = False        # rear sector masked out of the scan
+    front_half_deg: float = 0.0     # cone half-angles actually in use
+    side_half_deg: float = 0.0
+    # --- dynamic obstacles / reaction -----------------------------------------
+    #: Closing speed on the nearest obstacle ahead, m/s, +ve = gap shrinking.
+    #: Measured from the track rather than assumed from our own ground speed,
+    #: so an object moving toward us registers even while we hover.
+    closing_ms: float = 0.0
+    #: Tracked obstacles currently moving under their own power.
+    dynamic_count: int = 0
+    #: Stop distance actually in force this tick. Grows above avoidance_stop_m
+    #: with closing speed, so a fast approach brakes earlier than a slow one.
+    stop_distance_m: float = 0.0
+    #: Lateral departure from the straight line to the active waypoint, m.
+    #: Capped by avoidance_max_offtrack_m - this is the "do not go off course".
+    offtrack_m: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -341,6 +404,17 @@ class MissionState(Message):
     mode: str = "UNKNOWN"
     avoiding: bool = False
     message: str = ""
+    # Safety state, surfaced so the operator can see the limits on the
+    # dashboard rather than inferring them from behaviour.
+    pilot_override: bool = False   # the human has the aircraft
+    alt_ceiling_m: float = 0.0     # hard ceiling, metres above home
+    arm_refusal: str = ""          # the autopilot's own words, if it refused
+    # The launch point everything is measured from. Published so the dashboard
+    # and any other consumer read the navigator's home rather than latching a
+    # second, possibly different, one of their own.
+    home_lat: float = 0.0
+    home_lon: float = 0.0
+    home_set: bool = False
 
 
 @dataclass
@@ -349,6 +423,102 @@ class NavCommand(Message):
 
     command: str = "noop"    # arm|disarm|set_mode|takeoff|goto|rtl|land|brake|velocity
     params: dict[str, Any] = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Firebase parcel delivery
+# ---------------------------------------------------------------------------
+@dataclass
+class FcMessage(Message):
+    """One STATUSTEXT from the autopilot.
+
+    These carry the *reason* a command was refused ("PreArm: GPS glitching",
+    "Arm: AHRS: EKF3 vel error"). Logging them is not enough - without the
+    reason on screen a refused arm looks like the ground station is broken.
+    """
+
+    text: str = ""
+    severity: int = 6          # MAV_SEVERITY; <=3 is an error
+    is_prearm: bool = False    # a refusal to arm, as opposed to chatter
+
+
+@dataclass
+class MissionUploadResult(Message):
+    """Outcome of writing a mission into the autopilot's own mission slot.
+
+    Published by MavlinkNode after it drains an ``upload_mission`` command, so
+    the delivery node can report "the plan is on the Pixhawk" honestly instead
+    of assuming a fire-and-forget bus message succeeded.
+    """
+    ok: bool = False
+    items: int = 0
+    message: str = ""
+
+
+@dataclass
+class DeliveryOrder(Message):
+    """One customer order pulled out of Firebase.
+
+    ``target_lat``/``target_lon`` are the *only* values the customer supplies;
+    altitude and hover time are filled in from config, so a buggy or hostile
+    client cannot talk the aircraft into a height or a loiter we did not pick.
+    """
+
+    order_id: str = ""
+    recipient_id: str = ""
+    target_lat: float = 0.0
+    target_lon: float = 0.0
+    hover_alt_m: float = 2.0
+    hover_seconds: float = 15.0
+    created_at: str = ""
+    source: str = "firestore"
+    doc_id: str = ""            # Firestore document id, for write-back
+    status: str = ""            # the order's own status field, as the app set it
+
+
+@dataclass
+class DeliveryState(Message):
+    """Everything the GCS delivery panel renders, in one message."""
+
+    phase: DeliveryPhase = DeliveryPhase.IDLE
+    order_id: str = ""
+    recipient_id: str = ""
+    target_lat: float = 0.0
+    target_lon: float = 0.0
+    hover_alt_m: float = 0.0
+    hover_seconds: float = 0.0
+    hover_remaining_s: float = 0.0
+    distance_m: float = 0.0          # home -> target, great-circle
+    remaining_m: float = 0.0         # aircraft -> target, great-circle
+    waypoints: int = 0               # legs in the expanded mission
+    auto_accept: bool = False
+    fc_mission_uploaded: bool = False
+    link: str = "disabled"           # disabled|no-credentials|connecting|online|error
+    message: str = ""
+    last_error: str = ""
+    # The whole order book, so the GCS can show every order the app has placed
+    # rather than only the one being flown. Plain dicts: this crosses to the
+    # browser as JSON and nothing downstream needs the richer type.
+    orders: list = field(default_factory=list)    # awaiting dispatch, oldest first
+    recent: list = field(default_factory=list)    # last few of any status
+    selected_order_id: str = ""                   # which one ACCEPT would fly
+
+
+@dataclass
+class DeliveryBleResult(Message):
+    """The BLE handshake's drop gates (HMAC mutual auth + micro-geofence +
+    DROP HMAC, all in drone_ble_peripheral.py's drop_characteristic) passed
+    for the order being flown.
+
+    Bridged from the peripheral (a separate asyncio/D-Bus process) through
+    GcsHub._on_ble_delivery_result onto Topics.DELIVERY_BLE_RESULT, on the
+    core bus - independent of the optional novelty layer's own, differently
+    shaped BleAuthEvent/NoveltyTopics.BLE_AUTH_EVENT. NavigationNode reads
+    this to cut a delivery hover short; see its ble_early_rtl_wait_s.
+    """
+
+    order_id: str = ""
+    success: bool = False
 
 
 # ---------------------------------------------------------------------------

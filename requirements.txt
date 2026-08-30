@@ -13,3 +13,8 @@ websockets>=12.0
 
 # Hardware-only dependencies live in requirements-hardware.txt so that a
 # development machine (or the simulator) does not need them installed.
+
+# Firestore order feed for the delivery node. Optional: without it the
+# delivery node reports link 'no-credentials' and the file/inject order
+# sources still work.
+firebase-admin>=6.5

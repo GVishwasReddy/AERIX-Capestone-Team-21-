@@ -38,6 +38,29 @@ class Topics:
     MISSION_PLAN = "/mission/plan"        # the loaded Mission (waypoints)
     MISSION_CMD = "/mission/cmd"          # request a mission action
     MAVLINK_CMD = "/cmd/mavlink"          # NavCommand -> MavlinkNode
+    MISSION_UPLOAD = "/mission/upload"    # result of an FC mission upload
+    FC_MESSAGE = "/telemetry/fc_message"  # autopilot STATUSTEXT (PreArm, EKF...)
+
+    # --- Firebase parcel delivery -------------------------------------------
+    DELIVERY_ORDER = "/delivery/order"    # DeliveryOrder pulled from Firebase
+    DELIVERY_STATE = "/delivery/state"    # DeliveryState for the GCS panel
+    # DeliveryBleResult, bridged from drone_ble_peripheral.py's drop gates
+    # (HMAC auth + geofence + DROP HMAC) via GcsHub. An event, not a standing
+    # state - see EVENT_TOPICS below - so a node recreated mid-flight cannot
+    # replay a previous order's stale "delivered" signal into a new hold.
+    DELIVERY_BLE_RESULT = "/delivery/ble_result"
+
+    # --- Command topics ------------------------------------------------------
+    # A request to *act*, not a state to observe. The bus refuses to latch
+    # these (see MessageBus.publish), so a subscriber that attaches after the
+    # fact can never be handed a stale command and carry it out. That matters
+    # because Supervisor recreates a dead node by calling its constructor
+    # again, which re-subscribes: with latching left on, a recreated
+    # MavlinkNode replayed the last command it ever saw - an 'arm' or
+    # 'takeoff' spinning the props back up with nobody asking.
+    #
+    # Any new topic carrying an instruction belongs in here.
+    EVENT_TOPICS = frozenset({MISSION_CMD, MAVLINK_CMD, DELIVERY_BLE_RESULT})
 
     # --- Diagnostics --------------------------------------------------------
     DIAGNOSTICS = "/diagnostics"

@@ -125,7 +125,33 @@ class SimWorld:
                 self._cmd_vel = None
                 self._target = None
             elif name == "set_mode":
-                s.mode = str(p.get("mode", s.mode)).upper()
+                mode = str(p.get("mode", s.mode)).upper()
+                s.mode = mode
+                if mode in ("RTL", "SMART_RTL"):
+                    self._target = (0.0, 0.0, s.z if s.z > 0.5 else 0.0)
+                    self._cmd_vel = None
+                elif mode == "LAND":
+                    self._target = (s.x, s.y, 0.0)
+                    self._cmd_vel = None
+                elif mode in ("POSHOLD", "LOITER", "BRAKE", "ALT_HOLD"):
+                    # Park exactly where we are.
+                    #
+                    # WARNING - this is only true of BRAKE. Real ArduPilot
+                    # POSHOLD/LOITER/ALT_HOLD take their ALTITUDE from the
+                    # pilot's throttle stick: parked is what they do for a
+                    # pilot holding throttle at centre, and a full-rate descent
+                    # is what they do for the untouched transmitter of an
+                    # autonomous flight. This model has no stick to read, so it
+                    # cannot show that, and for months it let a POSHOLD
+                    # drop-point hover pass in sim while the same hover flew
+                    # the real aircraft into the ground at 2.4 m/s.
+                    #
+                    # Nothing in the delivery path should be entering these
+                    # modes now (NavigationNode._STICK_ALTITUDE_MODES rejects
+                    # them), so do not read a green sim run here as evidence
+                    # that a stick-driven hold is safe.
+                    self._target = (s.x, s.y, s.z)
+                    self._cmd_vel = None
             elif name == "takeoff":
                 s.mode = "GUIDED"
                 self._target = (s.x, s.y, float(p.get("altitude", 5.0)))
@@ -137,8 +163,8 @@ class SimWorld:
                 self._target = (east, north, float(p.get("alt", s.z or 5.0)))
                 self._cmd_vel = None
                 s.mode = "GUIDED"
-            elif name == "rtl":
-                s.mode = "RTL"
+            elif name in ("rtl", "smart_rtl"):
+                s.mode = "SMART_RTL" if name == "smart_rtl" else "RTL"
                 self._target = (0.0, 0.0, s.z if s.z > 0.5 else 0.0)
                 self._cmd_vel = None
             elif name == "land":
@@ -164,6 +190,14 @@ class SimWorld:
                 s.yaw = wrap_pi(s.yaw - delta)
             elif name == "set_speed":
                 self._cruise_speed = max(0.2, float(p.get("speed", self._cruise_speed)))
+            elif name == "set_home":
+                self._home_lat = float(p.get("lat", self._home_lat))
+                self._home_lon = float(p.get("lon", self._home_lon))
+            elif name in ("upload_mission", "clear_mission", "noop"):
+                # Mission upload is an autopilot-storage concern; the simulated
+                # aircraft is flown by goto setpoints, same as the real one in
+                # GUIDED, so there is nothing to store.
+                pass
 
     # -- physics -------------------------------------------------------------
     def step(self, dt: float | None = None) -> None:
@@ -230,9 +264,19 @@ class SimWorld:
 
     def _handle_arrival(self) -> None:
         s = self.state
-        if s.mode in ("RTL", "LAND") and s.z <= 0.05:
+        if s.mode in ("RTL", "SMART_RTL"):
+            # A real return-to-launch is two stages: fly home at altitude, then
+            # descend and disarm. Without the second stage the aircraft hovers
+            # over home forever and the mission never reports COMPLETE.
+            if (
+                math.hypot(s.x, s.y) < 1.0
+                and self._target is not None
+                and self._target[2] > 0.0
+            ):
+                self._target = (0.0, 0.0, 0.0)
+        if s.mode in ("RTL", "SMART_RTL", "LAND") and s.z <= 0.05:
             dist_home = math.hypot(s.x, s.y)
-            if s.mode == "LAND" or dist_home < 1.0:
+            if s.mode == "LAND" or dist_home < 1.5:
                 s.armed = False
                 s.vx = s.vy = s.vz = 0.0
 

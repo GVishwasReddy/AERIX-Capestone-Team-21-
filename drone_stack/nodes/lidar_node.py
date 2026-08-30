@@ -15,7 +15,7 @@ import math
 
 from drone_stack.bus import MessageBus
 from drone_stack.bus.topics import Topics
-from drone_stack.interfaces.lidar_interface import LidarInterface
+from drone_stack.interfaces.lidar_interface import FovMask, LidarInterface
 from drone_stack.msg import Diagnostic, DiagLevel, LaserScan, PointCloud, ScanState
 from drone_stack.srv import ServiceRegistry, ServiceRequest, ServiceResponse
 from drone_stack.utils.config import Config
@@ -44,6 +44,9 @@ class LidarNode(NodeBase):
         self.services = services or ServiceRegistry()
         self._reconnect_interval = float(section.get("reconnect_interval_s", 2.0))
         self._port = section.get("port", "")
+        # Reported to the GCS so the radar can draw the front line and the
+        # ignored rear wedge from the same numbers the driver masks with.
+        self.fov = FovMask(section)
         self._scan_count = 0
         self._empty_reads = 0
         self._scan_state = ScanState.SCANNING
@@ -120,6 +123,8 @@ class LidarNode(NodeBase):
             beams=scan.count,
             valid_returns=valid,
             scans=self._scan_count,
+            fov_deg=self.fov.fov_deg,
+            blind_deg=self.fov.blind_deg,
         )
 
     @staticmethod

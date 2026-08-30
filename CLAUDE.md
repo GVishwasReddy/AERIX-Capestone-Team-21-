@@ -287,7 +287,151 @@ person), so this is a *model quality* limit, not a pipeline bug. Consequences:
 - Graceful degradation: if HailoRT / a `.hef` is missing, `_build_hailo_processors`
   returns `None` and the cameras serve raw video (sim-safe, no error).
 
+
+
+## 11. Firebase delivery (order -> waypoints -> hover -> smart RTL)
+
+One coordinate from the phone app becomes a flight. `FirebaseDeliveryNode`
+(`nodes/firebase_delivery_node.py`) polls the order source, offers the order to
+the operator, and hands the accepted target to `NavigationNode`, which expands
+it into waypoints and flies the profile.
+
+### The flight profile
+Ground start -> home latched at power-on -> climb to **3 m** -> fly to the drop
+point -> **hold in GUIDED for `hover_seconds`** -> **SMART_RTL** home -> land
+and disarm.
+
+### ⚠️ Never hover in POSHOLD/LOITER — it broke the airframe twice (2026-08-27)
+
+`delivery.hover_mode` was `POSHOLD`. **POSHOLD, LOITER and ALT_HOLD take their
+ALTITUDE from the pilot's throttle stick.** They hold altitude for a pilot
+holding throttle at centre — and during an autonomous delivery nobody is
+touching the transmitter, so the stick rests at `RC3_MIN` (999 µs here) and
+ArduPilot reads it as *"descend at the full pilot rate."*
+
+Proven from the FC's own dataflash logs (453 and 454, both flights identical):
+
+| t (s) | what |
+|---|---|
+| —     | holding 3.4–3.7 m in GUIDED, climb rate ~0, `ThO`≈0.20 (= `MOT_THST_HOVER`) |
+| 622.35 | `MODE POSHOLD (GCS_COMMAND)` — the navigator's `_enter_hover` |
+| 622.70 | descent begins; **`DAlt` (desired alt) is driven down** — commanded, not a failure |
+| 623.9  | −233 cm/s |
+| 624.7  | passes Alt 0 still doing **−251 cm/s ⇒ ~2.5 m/s impact** — this is what broke the landing gear |
+| 624.8  | ch6 → 2000: the **pilot reacting**, 1.3 s *after* the aircraft was already down |
+| 627.2  | `RC8: MotorEStop HIGH` — pilot cutting motors post-crash |
+
+The throttle channel read 999 throughout. `PILOT_SPEED_DN` was `0`, which means
+"use `PILOT_SPEED_UP`" = 250 cm/s — exactly the observed rate. The E-stop and
+the LAND switch in the logs are the **pilot's reaction, not the cause**; do not
+re-diagnose this as pilot error.
+
+The fix, in three layers:
+1. `delivery.hover_mode: GUIDED` in `default.yaml` + `real.yaml`. The hold is
+   entered by re-asserting the position setpoint (a `goto`), **not** a mode
+   change, and issues zero commands for its duration.
+2. `NavigationNode._STICK_ALTITUDE_MODES` — `_safe_hover_mode` **rejects** any
+   stick-driven hover mode at construction and substitutes GUIDED, so config
+   cannot re-arm the crash. `_guard_hover_altitude` is the backstop: sag more
+   than `hover_alt_tolerance_m` (1 m) below the hold altitude and it re-asserts
+   GUIDED + the target, once per breach.
+3. FC param `PILOT_SPEED_DN` `0 -> 100` (`scripts/set_pilot_descent_limit.py`)
+   so a *pilot* selecting POSHOLD with the throttle down gets 1 m/s, not 2.5.
+   Autonomous descents are untouched (`LAND_SPEED` 30 cm/s, `WPNAV_SPEED_DN` 150).
+
+**Why sim never caught it:** `SimWorld.set_mode` parks the aircraft in
+POSHOLD/LOITER — it has no throttle stick to model. A stick-driven hover passes
+in sim and destroys the real aircraft. Never take a green sim run as evidence
+that a hold mode is safe.
+
+**Still outstanding (transmitter-side, needs the operator):** `FLTMODE_CH=6`
+with `FLTMODE1/2/3/5 = STABILIZE (0)`. STABILIZE maps the throttle stick
+*directly to motor output* — grabbing the mode switch mid-delivery and landing
+on one of those detents with the throttle down is an immediate free-fall, and
+`PILOT_SPEED_DN` does not help there. Set those positions to LOITER/RTL/LAND,
+and keep the throttle stick at mid during autonomous flight.
+
+- **The 3 m ceiling is absolute.** Every commanded altitude passes through
+  `NavigationNode._clamp_alt`, at both the plan level and in `_send`, so no
+  service call, mission, NL command or order can exceed it. The `max_altitude`
+  failsafe (ceiling + `altitude_margin_m`) is a backstop for an *uncommanded*
+  climb only.
+- **Home latches once**, on the ground, at the first 3D fix while disarmed. It
+  never moves afterwards, so a mid-flight GPS jump cannot relocate "home".
+- **SMART_RTL falls back to RTL.** ArduPilot refuses SMART_RTL silently when its
+  path buffer is empty; `_do_rtl` watches for the mode not taking within 3 s and
+  switches to plain RTL rather than loitering forever.
+- **The transmitter always wins.** Nothing here disables RC LAND or motor
+  cutoff. Instead the navigator *arbitrates*: an uncommanded mode change is
+  detected (after `pilot_override_grace_s`, so command lag is not mistaken for a
+  takeover), the navigator stands down into MANUAL and stops issuing commands.
+  Only an operator `resume` / `start_mission` hands control back.
+
+### Order sources (`interfaces/firebase_interface.py`)
+`firestore` (real), `file` (sim / `scripts/inject_order.py`), `none`.
+Field names follow the Flutter `OrderModel`: `targetLat`/`targetLng`,
+`status: DISPATCHED`, `createdAt`. Write-back uses separate `drone*` keys with
+`merge=True` so the app's `status == 'DISPATCHED'` query keeps working and the
+customer's order does not vanish from their screen at takeoff.
+
+**The service-account key is required and is not in the repo.**
+Firebase console -> Project settings -> Service accounts -> Generate new private
+key, then:
+
+    scripts/firebase_setup.py <downloaded-key.json>
+
+It validates the file (catching the common `google-services.json` mistake),
+installs it at `config/firebase-service-account.json` mode 600, and does a live
+read of the `orders` collection. The node retries every poll, so no restart is
+needed. Without it the delivery panel shows link `no-credentials` and an amber
+setup banner. `firebase-admin` must be in the venv (it is in `requirements.txt`).
+
+### Safety gates
+`auto_accept: false` in `real.yaml` — a human presses ACCEPT & FLY. Orders that
+were already `DISPATCHED` when the node started are *never* auto-accepted (a
+stale row must not launch an aircraft on boot); they are flagged
+"pre-existing - confirm before flying". Targets are refused beyond
+`max_delivery_radius_m`, at null island, or without a GPS fix.
+
+### The GCS panel
+The dashboard renders only what the node publishes — no delivery state lives in
+the browser, so a reload or a second operator sees the same thing. It shows the
+order inbox (**every** order the app has written; unflyable ones stay visible
+with their reason), a six-step phase timeline, live ETA and remaining distance,
+and the full order book in the bottom panel. Services: `delivery_accept`,
+`delivery_reject`, `delivery_abort`, `delivery_select`, `delivery_refresh`,
+`delivery_set_auto`, `delivery_status`, `delivery_inject`.
+
+### Testing it without a phone or a key
+    scripts/inject_order.py --north 40           # 40 m north, waits for ACCEPT
+    scripts/inject_order.py --lat .. --lon .. --auto   # simulation only
+The GCS "Test order" button does the same at the map cursor.
+
+### Gotchas
+- `ServiceRegistry.call(name, /, **data)` — `name` is **positional-only**. A
+  payload key called `name` used to collide with it; pass `mission_name`.
+- The FC mission upload is queued on `Topics.MISSION_UPLOAD` so the blocking
+  MAVLink handshake runs on MavlinkNode's own thread (no reader race); the real
+  outcome comes back as `MissionUploadResult`.
+- `SimWorld.set_mode` genuinely changes behaviour (POSHOLD parks, RTL descends
+  and disarms). Without that a simulated hover or RTL "passes" while the
+  aircraft keeps flying to its last goto.
+
 ### Changelog
+- **2026-08-27** — **Hard-landing root cause found and fixed.** The drop-point
+  hover was flown in POSHOLD, whose altitude comes from the pilot's throttle
+  stick; with the transmitter untouched that commanded a 2.4 m/s descent into
+  the ground on every delivery, breaking the landing gear (dataflash 453/454).
+  Hover is now GUIDED, stick-driven hover modes are rejected in code, a hover
+  altitude-sag backstop was added, and `PILOT_SPEED_DN` was capped at 1 m/s.
+  See the ⚠️ section above. 273 tests pass (3 pre-existing `test_model_registry`
+  failures are unrelated — they assert a missing `.hef`, which now exists).
+- **2026-08-20** — Firebase delivery chain end to end: order -> expanded
+  waypoints -> 3 m cruise -> 60 s POSHOLD -> SMART_RTL -> land/disarm, with the
+  altitude ceiling and pilot-override arbitration described in §11. New
+  `FirebaseDeliveryNode`, `firebase_interface`, GCS delivery panel with an order
+  inbox, `scripts/firebase_setup.py`, `scripts/inject_order.py`. Verified end to
+  end in sim; live Firestore link confirmed against the phone app.
 - **2026-08-10 (later)** — Hailo NPU overlays on both camera feeds (terrain seg
   on USB, yolov8n person detect on Pi cam); decoupled USB capture + manual
   exposure; Pi cam 30 fps. See §10. Backups in `.claude_backup_20260810_214900`.

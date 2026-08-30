@@ -8,7 +8,8 @@
 # To go from SIMULATION to REAL HARDWARE you normally only change:
 #     mode:                sim  -> real
 #     mavlink.connection:  udp  -> /dev/ttyACM0   (your Pixhawk serial port)
-#     lidar.port:               -> /dev/ttyUSB0   (your RPLIDAR serial port)
+#     lidar.port:               -> /dev/serial/by-id/usb-Silicon_Labs_...-port0
+#                                  (RPLIDAR; use by-id, not /dev/ttyUSBn)
 # Everything else keeps working unchanged.
 # =============================================================================
 
@@ -46,15 +47,37 @@ mavlink:
 # -----------------------------------------------------------------------------
 lidar:
   enabled: true
-  port: "/dev/ttyUSB0"       # RPLIDAR USB serial device
+  # Stable by-id path; /dev/ttyUSBn shifts after any USB bus reset.
+  port: "/dev/serial/by-id/usb-Silicon_Labs_CP2102N_USB_to_UART_Bridge_Controller_3e8e15cb1664ef11b066daa9c169b110-if00-port0"
   baud: 460800               # C1 default baudrate
   frame_id: "lidar_link"
   rate_hz: 10                # publish rate for assembled scans
   reconnect_interval_s: 2.0
   min_range_m: 0.15
   max_range_m: 12.0
-  angle_offset_deg: 0.0      # mounting offset applied to every beam
+  # Beam-angle handedness of the physical device. Slamtec units number their
+  # beams CLOCKWISE looking down on the unit; LaserScan/PointCloud and every
+  # consumer of them are COUNTER-CLOCKWISE (x forward, y left). Leave true for
+  # an RPLIDAR - set false only for a sensor that already reports CCW. Getting
+  # this wrong mirrors the radar left/right AND makes avoidance dodge the
+  # wrong way. Real driver only; the simulator emits CCW natively.
+  clockwise: true
+  # Mounting offset. This is what DEFINES the front: it is the device's own
+  # RAW (clockwise) angle in the direction of the airframe's nose. Point the
+  # nose, read what the LiDAR calls that direction, put the number here; 0 deg
+  # then lands on the nose and every angle below is measured from it.
+  # Applied AFTER the handedness flip above.
+  angle_offset_deg: 0.0
   invert: false              # set true if the unit is mounted upside-down
+  # Field of view, centred on the 0 deg front reference above: 135 deg to the
+  # left + 135 deg to the right = 270 deg scanned. The remaining 90 deg,
+  # directly behind the aircraft, is blanked to inf inside the driver and
+  # never reaches the point cloud, the obstacle detector, collision avoidance
+  # or the GCS radar. That rear wedge always contains the airframe itself and
+  # whatever the drone is parked next to - permanent, stationary returns that
+  # would otherwise keep the avoidance logic braking for nothing.
+  fov_enabled: true
+  fov_deg: 250.0             # set 360.0 (or fov_enabled: false) for full circle
 
 # -----------------------------------------------------------------------------
 # Sensor fusion (Phase 4) - complementary filter now, EKF-ready interface
@@ -87,13 +110,38 @@ navigation:
   enabled: true
   rate_hz: 10
   waypoint_radius_m: 1.5     # distance at which a waypoint is "reached"
-  cruise_altitude_m: 5.0
+  # Low-altitude delivery profile: this airframe operates under a hard 3 m
+  # ceiling (safety.max_altitude_m). Every altitude the navigator commands is
+  # clamped to it, so these are the working values, not just requests.
+  cruise_altitude_m: 2.0
   cruise_speed_ms: 3.0
-  takeoff_altitude_m: 5.0
+  takeoff_altitude_m: 2.0
   avoidance_distance_m: 2.5  # start avoiding obstacles closer than this
   avoidance_stop_m: 1.2      # hard stop / brake distance
   avoidance_enabled: true    # collision avoidance active on startup
+  # Reactive sector avoidance (ported from Drone-Autonomy-ROS2). The scan is
+  # split into a front cone and two side cones; when the front is blocked the
+  # aircraft sidesteps toward whichever side has more room.
+  avoidance_front_half_deg: 50.0   # half-angle of the cone that gates SLOW/STOP
+  avoidance_side_half_deg: 125.0   # side cones run to the edge of lidar.fov_deg
+  avoidance_dodge_enabled: true    # false -> brake and hold, the old behaviour
+  avoidance_dodge_speed_ms: 1.0    # lateral sidestep speed
+  avoidance_dodge_clear_m: 2.5     # a side counts as open only past this
+  avoidance_dodge_timeout_s: 5.0   # give up sidestepping and hold after this
   auto_arm: true             # arm automatically when a mission starts (sim-safe)
+
+# Streams the LiDAR to the flight controller as OBSTACLE_DISTANCE so
+# ArduPilot's own avoidance can limit the PILOT's stick demand. This is the
+# only avoidance that survives a manual takeover - the navigator above stands
+# down the moment the transmitter moves. Off by default: it does nothing until
+# the FC parameters are set (see proximity_node.py).
+proximity:
+  enabled: false
+  rate_hz: 10
+  min_distance_m: 0.30
+  max_distance_m: 12.0
+  min_points: 2      # returns a sector needs before it reports at all
+  filter_depth: 3    # sector distance is the median of this many revolutions
 
 safety:
   battery_low_voltage: 14.0      # 4S nominal; trigger RTL
@@ -104,8 +152,41 @@ safety:
   failsafes_enabled: true        # master switch for GCS-side auto-failsafes
   min_satellites: 6
   min_gps_fix_type: 3            # 3 = 3D fix
-  geofence_radius_m: 200.0
-  max_altitude_m: 120.0
+  # Horizontal fence, metres from home (the point the aircraft armed at).
+  # Exceeding it triggers RTL. Kept close above max_delivery_radius_m: the
+  # route is home -> target -> home, so a legal delivery never approaches it,
+  # and the gap is only there to absorb GPS wander and waypoint overshoot.
+  geofence_radius_m: 75.0
+  # HARD CEILING, metres above the launch point. NavigationNode clamps every
+  # commanded altitude to this value; exceeding it by altitude_margin_m (an
+  # uncommanded climb) trips the max_altitude failsafe and brakes.
+  max_altitude_m: 2.0
+  # How far above max_altitude_m an *uncommanded* climb must go before the
+  # hardlock brakes. Not slack in the ceiling: commanded altitudes are clamped
+  # to exactly max_altitude_m. This is only fault-detection headroom, sized
+  # above baro/EKF noise (~0.3 m) so a hovering aircraft is not nuisance-braked.
+  altitude_margin_m: 0.7
+  # How long the FC may report a mode we did not command before we conclude
+  # the pilot took over on the transmitter and stop sending commands.
+  pilot_override_grace_s: 1.5
+  # Transmitter authority. The RC transmitter is the manual override and
+  # always outranks anything the companion computer wants. Any channel that
+  # moves more than rc_override_deadband_us from the baseline captured when
+  # the link came up hands the aircraft to the pilot immediately - no grace
+  # period, because the grace period is what the pilot was fighting.
+  rc_override_deadband_us: 60
+  # RC frames keep arriving briefly after the transmitter is switched off,
+  # so anything older than this counts as no link rather than a live one.
+  rc_stale_s: 3.0
+  # Minimum spacing between repeated SET_MODE frames for the same mode. A
+  # mode re-sent every tick pulls the aircraft back out of whatever the
+  # pilot just selected and re-initialises the FC's altitude target.
+  mode_resend_interval_s: 1.0
+  # Arming: the autopilot can refuse for a while as GPS/EKF settle, so retries
+  # are paced (not fired every step) and bounded - a prearm check that has not
+  # cleared in arm_timeout_s will not clear by being asked again.
+  arm_retry_interval_s: 1.0
+  arm_timeout_s: 30.0
 
 # -----------------------------------------------------------------------------
 # Diagnostics (Phase 9)
@@ -169,3 +250,73 @@ novelty:
   rate_hz: 5.0              # DeliveryNode control-loop rate
   flight_logs_dir: flight_logs   # EvidenceLogger JSONL output directory
   repo_dir: .                     # for the evidence log's git-hash stamp
+
+# -----------------------------------------------------------------------------
+# Firebase parcel delivery (FirebaseDeliveryNode)
+# -----------------------------------------------------------------------------
+# One customer order in Firestore -> an expanded waypoint list -> a flight to
+# the drop point -> a timed position hold -> smart RTL home. Everything the
+# node does is mirrored to the GCS delivery panel in real time.
+#
+# Altitudes here are still clamped by safety.max_altitude_m, which is the one
+# number that decides how high this aircraft is ever allowed to go.
+delivery:
+  enabled: true
+  source: firestore          # firestore | file | none
+  collection: orders         # Firestore collection the Flutter app writes to
+  # Service-account JSON downloaded from the Firebase console
+  # (Project settings -> Service accounts -> Generate new private key).
+  # Relative paths resolve against the repo root.
+  credentials_path: "config/firebase-service-account.json"
+  # The AERIX Firebase project (from the Flutter app's google-services.json).
+  # Set explicitly so a mis-scoped key fails loudly instead of quietly
+  # reading someone else's "orders" collection.
+  project_id: "aerix-drone-delivery"
+  file_path: "config/pending_order.json"   # used when source == file
+  poll_interval_s: 3.0       # how often to ask Firestore for new orders
+  rate_hz: 2                 # node loop rate
+
+  # Safety gates ------------------------------------------------------------
+  # false = a human presses "ACCEPT & FLY" on the GCS before the aircraft
+  # moves. Orders that were already in the database when the node started are
+  # never auto-accepted regardless, so a stale row cannot launch on boot.
+  auto_accept: false
+  # Orders with a target further than this from home are refused outright,
+  # before the aircraft moves. This is a gate, not a fence - it never fires in
+  # flight. Must stay below safety.geofence_radius_m.
+  max_delivery_radius_m: 60.0
+  require_gps_fix: true
+
+  # Flight profile ----------------------------------------------------------
+  hover_seconds: 15.0        # position hold over the drop point
+  hover_altitude_m: 2.0
+  # GUIDED only. POSHOLD and LOITER are "position hold" for a pilot holding
+  # the throttle at centre - during an autonomous delivery nobody is, the
+  # stick rests at RC3_MIN, and entering one commands a full-rate descent into
+  # the ground (it broke this airframe's landing gear twice; see
+  # NavigationNode._STICK_ALTITUDE_MODES). The navigator rejects those modes
+  # and substitutes GUIDED, so setting them here only produces an error log.
+  hover_mode: GUIDED
+  # Sag below hover_altitude_m that re-asserts the hold (_guard_hover_altitude).
+  hover_alt_tolerance_m: 1.0
+  # BLE handshake early-exit (added 2026-08-27): drone_ble_peripheral.py posts
+  # ble_delivery_result to the GCS once its own security gates (HMAC mutual
+  # auth, micro-geofence, DROP HMAC) all pass for the order being flown -
+  # GcsHub bridges that onto Topics.DELIVERY_BLE_RESULT and NavigationNode
+  # (_on_ble_delivery_result / _do_hover) cuts the drop-point hold short
+  # ble_early_rtl_wait_s after that signal, rather than waiting out the full
+  # hover_seconds. If the handshake never completes, hover_seconds is still
+  # the hard ceiling - RTL fires exactly as it always has. Set
+  # ble_early_rtl_enabled: false to fall back to the old pure-timer behavior
+  # without touching any code.
+  ble_early_rtl_enabled: true
+  ble_early_rtl_wait_s: 3.0
+  return_mode: SMART_RTL     # SMART_RTL retraces the outbound path; RTL is direct
+  leg_length_m: 25.0         # home->target line is split into legs this long
+  max_legs: 24
+  upload_to_fc: true         # also write the plan into the Pixhawk mission slot
+
+  # Write-back --------------------------------------------------------------
+  write_back: true           # push phase/telemetry onto the order document
+  status_field: status
+  dispatch_status: DISPATCHED

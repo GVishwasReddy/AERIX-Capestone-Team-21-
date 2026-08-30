@@ -5,6 +5,19 @@
 fixed-resolution :class:`~drone_stack.msg.LaserScan` (default 360 beams, one per
 degree) so every downstream consumer sees a stable layout.
 
+The RPLIDAR reports its beam angle **clockwise** looking down on the unit,
+while :class:`~drone_stack.msg.LaserScan` - and everything built on it -
+measures **counter-clockwise** (x forward, y left). ``lidar.clockwise``
+performs that handedness conversion; without it every return lands on the
+wrong side and the radar, the obstacle bearings and the avoidance direction
+all come out mirrored left/right.
+
+Beam 0 is the LiDAR's **front reference** (the face pointing at the nose of
+the airframe, see ``lidar.angle_offset_deg``). :class:`FovMask` keeps only the
+270 deg arc centred on it - 135 deg left, 135 deg right - and blanks the 90 deg
+wedge directly behind, which is permanently occupied by the airframe and
+whatever the drone is parked next to.
+
 The ``rplidar`` package is imported lazily so simulation never needs it.
 """
 from __future__ import annotations
@@ -17,10 +30,12 @@ from collections import deque
 from typing import Any
 
 from drone_stack.msg import LaserScan
-from drone_stack.utils.geometry import wrap_360
+from drone_stack.utils.geometry import wrap_180, wrap_360
 from drone_stack.utils.logging_setup import get_logger
 
 DEFAULT_BINS = 360
+# Total arc kept, centred on the LiDAR's front reference (see FovMask).
+DEFAULT_FOV_DEG = 250.0
 
 # The C1's CP210x USB-serial link occasionally reports "readable but returned no
 # data" when the Pi is under heavy IRQ/CPU pressure (e.g. the Hailo NPU driver's
@@ -57,6 +72,81 @@ def build_empty_ranges(bins: int) -> list[float]:
     return [math.inf] * bins
 
 
+class FovMask:
+    """Front-referenced angular window - which beams of a scan are usable.
+
+    The LiDAR is mounted with one face pointing at the nose of the airframe.
+    **That face is the 0 deg reference**; ``lidar.angle_offset_deg`` rotates the
+    device's raw angles onto it, so by the time a beam reaches this mask its
+    angle is already measured from the front line, positive to the left.
+
+    ``lidar.fov_deg`` (default 270) is the total arc kept, centred on that
+    reference: 135 deg to the left and 135 deg to the right. The remaining
+    ``360 - fov_deg`` (default 90 deg) - the wedge directly behind the aircraft
+    - is blanked to ``inf``. That sector permanently contains the airframe's own
+    tail and whatever the drone is standing next to; those returns never move,
+    so feeding them to ObstacleNode makes the avoidance logic brake for
+    obstacles that are effectively bolted to the aircraft.
+
+    Blanking happens *here*, in the interface, so every consumer downstream -
+    PointCloud, ObstacleNode, NavigationNode avoidance and the GCS radar - sees
+    the same view and no path can accidentally re-admit the rear sector.
+
+    Beams landing exactly on the +/-135 deg boundary are kept (a closed
+    window), so a 360-bin scan keeps 271 bins and blanks the 89 that fall
+    strictly inside the 90 deg blind wedge.
+    """
+
+    _EPS = 1e-9
+
+    def __init__(self, config: dict[str, Any] | None = None) -> None:
+        cfg = config or {}
+        self.enabled = bool(cfg.get("fov_enabled", True))
+        fov = float(cfg.get("fov_deg", DEFAULT_FOV_DEG))
+        self.fov_deg = min(360.0, max(0.0, fov))
+        if self.fov_deg >= 360.0:
+            self.enabled = False       # a full circle is not a mask
+        self.half_deg = self.fov_deg / 2.0
+        self.blind_deg = 360.0 - self.fov_deg
+        self._cache: dict[int, list[bool]] = {}
+
+    def keeps(self, angle_deg: float) -> bool:
+        """True if a beam ``angle_deg`` off the front line is inside the FOV."""
+        if not self.enabled:
+            return True
+        return abs(wrap_180(angle_deg)) <= self.half_deg + self._EPS
+
+    def keep_bins(self, bins: int) -> list[bool]:
+        """Per-bin keep flags for a ``bins``-beam scan (beam i at i*360/bins)."""
+        cached = self._cache.get(bins)
+        if cached is None:
+            width = 360.0 / bins
+            cached = [self.keeps(i * width) for i in range(bins)]
+            self._cache[bins] = cached
+        return cached
+
+    def apply(
+        self, ranges: list[float], intensities: list[float] | None = None
+    ) -> None:
+        """Blank every out-of-FOV beam of an assembled scan, in place."""
+        if not self.enabled:
+            return
+        for i, ok in enumerate(self.keep_bins(len(ranges))):
+            if not ok:
+                ranges[i] = math.inf
+                if intensities is not None:
+                    intensities[i] = 0.0
+
+    def describe(self) -> dict[str, Any]:
+        """FOV geometry for diagnostics and the GCS radar overlay (degrees)."""
+        return {
+            "enabled": self.enabled,
+            "fov_deg": self.fov_deg if self.enabled else 360.0,
+            "half_deg": self.half_deg if self.enabled else 180.0,
+            "blind_deg": self.blind_deg if self.enabled else 0.0,
+        }
+
+
 class RealLidar(LidarInterface):
     """Driver for a physical Slamtec RPLIDAR C1 over USB serial."""
 
@@ -69,8 +159,14 @@ class RealLidar(LidarInterface):
         self._min_range: float = float(config.get("min_range_m", 0.15))
         self._max_range: float = float(config.get("max_range_m", 12.0))
         self._offset_deg: float = float(config.get("angle_offset_deg", 0.0))
+        # True for every Slamtec unit: the device numbers its beams clockwise
+        # looking down on it, the stack works counter-clockwise. See
+        # _to_laserscan for why this is applied before the mounting offset.
+        self._clockwise: bool = bool(config.get("clockwise", True))
         self._invert: bool = bool(config.get("invert", False))
         self._bins = DEFAULT_BINS
+        # 270 deg front-referenced window; the rear 90 deg never enters a scan.
+        self._fov = FovMask(config)
 
         # raw-serial driver state (the pip `rplidar` lib cannot drive the C1)
         self._ser = None
@@ -233,11 +329,22 @@ class RealLidar(LidarInterface):
         ranges = build_empty_ranges(self._bins)
         intensities = [0.0] * self._bins
         bin_width = 360.0 / self._bins
+        keep = self._fov.keep_bins(self._bins)
         for quality, angle_deg, distance_mm in measurements:
-            angle = angle_deg + self._offset_deg
+            # Handedness first: negate the device's clockwise reading to get
+            # the stack's counter-clockwise angle. THEN rotate by the mounting
+            # offset - the offset names a direction in the device's own frame
+            # (the raw angle that points at the nose), so it must not be
+            # flipped along with the beam.
+            angle = -angle_deg if self._clockwise else angle_deg
+            angle += self._offset_deg
             if self._invert:
                 angle = -angle
             idx = int(wrap_360(angle) / bin_width) % self._bins
+            if not keep[idx]:
+                # Rear blind sector - dropped at the driver so no consumer
+                # (cloud, obstacles, avoidance, radar) can ever see it.
+                continue
             rng = distance_mm / 1000.0
             if rng < self._min_range or rng > self._max_range:
                 continue

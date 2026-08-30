@@ -310,18 +310,69 @@ class UsbCamera(_BaseCamera):
 class PiCamera(_BaseCamera):
     """Raspberry Pi camera (imx708) via picamera2.
 
-    When a ``processor`` is attached we capture raw frames as numpy arrays so the
-    Hailo overlay can be drawn, then JPEG-encode with OpenCV. With no processor
-    we still use the array path (uniform code); encoding 720p on the Pi 5 CPU at
-    ~15 fps is cheap and keeps the pipeline identical to the USB camera.
+    Capture and processing are **decoupled** (matching ``UsbCamera``): a
+    lightweight grabber thread keeps only the freshest raw frame, while
+    ``_run`` annotates (Hailo person-detection overlay) + JPEG-encodes the
+    latest frame in parallel.  This stops annotation/encoding time from
+    throttling the capture cadence, so the published rate tracks the camera
+    sensor instead of ``capture + annotate + encode`` summed.
+
+    Without decoupling, picamera2's internal FIFO queue grows whenever the
+    consumer cannot keep up and ``capture_array()`` returns progressively
+    OLDER frames - the lag accumulates and produces a visible "water mirror"
+    effect during flight.  The grabber thread drains the queue as fast as
+    the sensor delivers, so the encoder always sees the freshest frame.
     """
 
     def __init__(self, cam_id: int, name: str = "PiCam",
                  width: int = 1280, height: int = 720, skip: int = 1,
-                 fps: int = 32, processor: Optional[Processor] = None) -> None:
+                 fps: int = 30, processor: Optional[Processor] = None) -> None:
         super().__init__(cam_id, name, skip=skip, processor=processor)
         self._req_w, self._req_h = width, height
         self._fps_cap = fps
+        self._raw = None            # latest captured BGR frame
+        self._raw_lock = threading.Lock()
+        self._raw_evt = threading.Event()
+
+    def _grabber(self, picam) -> None:
+        """Continuously read the newest frame; never blocks the encoder."""
+        while not self._stop.is_set() and self._grab_ok:
+            try:
+                frame = picam.capture_array()
+            except Exception:  # noqa: BLE001
+                self._grab_ok = False
+                self._raw_evt.set()
+                return
+            if frame is None:
+                self._grab_ok = False
+                self._raw_evt.set()
+                return
+            with self._raw_lock:
+                self._raw = frame
+            self._raw_evt.set()
+
+    @staticmethod
+    def _denoise(frame):
+        """Wavelet-style spatial denoise to suppress rolling-shutter ripple.
+
+        Uses OpenCV's non-local-means denoising (fastNlMeansDenoisingColored)
+        which is the closest built-in equivalent to wavelet soft-thresholding.
+        Parameters are tuned for 720p on a Pi 5 at ~30 fps:
+          h=6, hColor=6    – moderate luminance + chrominance filtering
+          templateWindow=5 – small patch (fast)
+          searchWindow=17  – modest search area (speed/quality trade-off)
+
+        Processing only the kept frames (after _keep()) bounds the CPU cost
+        to at most ~15-30 denoise calls/sec rather than every raw capture.
+        """
+        import cv2
+        try:
+            return cv2.fastNlMeansDenoisingColored(
+                frame, None, h=6, hForColorComponents=6,
+                templateWindowSize=5, searchWindowSize=17,
+            )
+        except Exception:  # noqa: BLE001
+            return frame
 
     def _run(self) -> None:  # pragma: no cover - hardware loop
         try:
@@ -334,6 +385,7 @@ class PiCamera(_BaseCamera):
         backoff = 1.0
         while not self._stop.is_set():
             picam = None
+            grab_thread = None
             try:
                 picam = Picamera2()
                 # 'RGB888' from picamera2 is delivered in BGR byte order, which
@@ -352,13 +404,32 @@ class PiCamera(_BaseCamera):
                 picam.start()
                 self.connected = True
                 backoff = 1.0
-                _log.info("Pi camera (imx708) connected via capture_array")
+                _log.info("Pi camera (imx708) connected via capture_array "
+                          "(decoupled capture, denoise ON)")
+                # start grabber
+                self._grab_ok = True
+                self._raw = None
+                self._raw_evt.clear()
+                grab_thread = threading.Thread(
+                    target=self._grabber, args=(picam,),
+                    name=f"cam-{self.name}-grab", daemon=True)
+                grab_thread.start()
+                # process the freshest frame as fast as annotate+encode allows
                 while not self._stop.is_set():
-                    frame = picam.capture_array()   # BGR, HxWx3
+                    if not self._raw_evt.wait(timeout=2.0):
+                        if not self._grab_ok:
+                            raise RuntimeError("grabber stalled")
+                        continue
+                    self._raw_evt.clear()
+                    if not self._grab_ok:
+                        raise RuntimeError("frame read failed")
+                    with self._raw_lock:
+                        frame = self._raw
                     if frame is None:
-                        raise RuntimeError("capture_array returned None")
+                        continue
                     if not self._keep():
                         continue
+                    frame = self._denoise(frame)    # suppress rolling-shutter ripple
                     frame = self._annotate(frame)   # Hailo person-detection overlay
                     ok, buf = cv2.imencode(
                         ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 60]
@@ -370,6 +441,9 @@ class PiCamera(_BaseCamera):
                 self.connected = False
                 _log.warning("Pi camera error: %s (retry in %.0fs)", exc, backoff)
             finally:
+                self._grab_ok = False
+                if grab_thread is not None:
+                    grab_thread.join(timeout=1.0)
                 try:
                     if picam is not None:
                         picam.stop()
@@ -430,6 +504,7 @@ def _draw_terrain_segmentation(frame_bgr, segmentation, safe_classes: set) -> "o
 
 
 def _build_novelty_processors(bus: Optional["MessageBus"]):
+    return None, None
     """Return (usb_processor, picam_processor) built from the novelty
     ``ModelRegistry`` - see the module docstring's "Novelty layer tap".
 
@@ -498,7 +573,8 @@ def _build_novelty_processors(bus: Optional["MessageBus"]):
 class CameraManager:
     """Owns both cameras; lazy-starts capture on first access."""
 
-    def __init__(self, bus: Optional["MessageBus"] = None) -> None:
+    def __init__(self, bus: Optional["MessageBus"] = None,
+                 enabled: bool = True) -> None:
         # *bus* is the shared MessageBus (GcsHub.bus) the novelty-layer
         # overlay processors publish structured detections/segmentation on
         # - see _build_novelty_processors. Optional so a caller with no bus
@@ -519,10 +595,27 @@ class CameraManager:
             1: PiCamera(1, name="P1", skip=1, fps=30, processor=picam_proc),
         }
         self._started = False
+        self._enabled = enabled
         self._lock = threading.Lock()
 
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
     def start(self) -> None:
+        """Bring both cameras up. A no-op when cameras are disabled.
+
+        The gate lives here rather than at the call sites because there are two
+        of them - GcsHub.start() and the /api/camera/{id}/stream handler, which
+        the dashboard hits on page load - and gating only the first left the
+        second opening cameras anyway.
+        """
         with self._lock:
+            if not self._enabled:
+                if not self._started:
+                    self._started = True     # log the reason once, not per request
+                    _log.info("cameras disabled by config - not starting capture")
+                return
             if self._started:
                 return
             self._started = True

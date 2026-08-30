@@ -108,7 +108,9 @@ def test_nl_move_up_sets_manual_target():
     assert resp.success
     assert node._phase == MissionPhase.MANUAL
     assert node._manual_target is not None
-    assert abs(node._manual_target[2] - 10.0) < 1e-6      # 5 current + 5 up
+    # 5 m current + 5 m up would be 10 m, but the altitude ceiling is absolute:
+    # a spoken command is not a way around it.
+    assert abs(node._manual_target[2] - node._alt_ceiling) < 1e-6
     gotos = [c for c in sent if isinstance(c, NavCommand) and c.command == "goto"]
     assert gotos, "a goto command should have been issued"
 

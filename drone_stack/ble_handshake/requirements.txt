@@ -1,0 +1,5 @@
+# Dependencies for drone_ble_peripheral.py and firebase_sync.py.
+# (drone_stack/ has its own separate requirements*.txt + venv.)
+
+bluez-peripheral
+firebase-admin

@@ -61,7 +61,7 @@ b { color:var(--txt); font-weight:600; }
 .col-radar { grid-column:2; grid-row:1; display:flex; flex-direction:column; gap:6px; min-height:0; }
 .map-panel { grid-column:3; grid-row:1; position:relative; padding:0; overflow:hidden; }
 .bottom    { grid-column:1 / -1; grid-row:2;
-             display:grid; grid-template-columns:repeat(5,1fr); gap:6px; min-height:0; }
+             display:grid; grid-template-columns:repeat(6,1fr); gap:6px; min-height:0; }
 
 /* ---------- panels ---------- */
 .panel {
@@ -271,3 +271,145 @@ body.radar-expanded #radar { max-width:min(80vh,80vw); }
   color:var(--amber); font-weight:600; border-radius:4px; padding:2px 4px;
 }
 .brake-tune input[type="range"] { width:100%; accent-color:var(--red); cursor:pointer; }
+
+/* ---------- delivery (Firebase order -> flight) ---------- */
+/* The sidebar card is the operator's decision surface: what was ordered, how
+   far it is, and the two buttons that commit or stop the aircraft. Colour is
+   driven entirely by the phase badge so the panel reads at a glance. */
+.link-dot { font-size:9px; color:var(--dim2); }
+.link-dot.online   { color:var(--green); }
+.link-dot.error,
+.link-dot.no-credentials { color:var(--red); }
+.link-dot.connecting { color:var(--amber); }
+
+.dlv-card {
+  background:var(--panel2); border:1px solid var(--edge);
+  border-radius:5px; padding:6px; margin-bottom:6px;
+}
+.dlv-phase { display:flex; align-items:center; gap:5px; margin-bottom:4px; }
+.dlv-badge {
+  font-size:9px; font-weight:700; letter-spacing:.6px; padding:2px 5px;
+  border-radius:3px; background:var(--btn); color:var(--dim);
+  border:1px solid var(--btn-edge);
+}
+.dlv-badge.pending   { background:var(--amberbg); color:var(--amber); border-color:var(--amber); }
+.dlv-badge.enroute,
+.dlv-badge.accepted  { background:var(--greenbg); color:var(--green); border-color:var(--green); }
+.dlv-badge.hovering  { background:var(--greenbg); color:var(--cyan);  border-color:var(--cyan);
+                       animation:dlv-pulse 1.4s ease-in-out infinite; }
+.dlv-badge.returning { background:var(--amberbg); color:var(--amber); border-color:var(--amber); }
+.dlv-badge.landed    { background:var(--greenbg); color:var(--green); border-color:var(--green); }
+.dlv-badge.rejected,
+.dlv-badge.aborted   { background:var(--redbg);   color:var(--red);   border-color:var(--red); }
+@keyframes dlv-pulse { 0%,100% { opacity:1; } 50% { opacity:.45; } }
+
+.dlv-order { font-size:10px; color:var(--dim); overflow:hidden;
+             text-overflow:ellipsis; white-space:nowrap; }
+.dlv-msg   { font-size:10px; color:var(--txt); line-height:1.35; margin-bottom:5px;
+             min-height:26px; }
+.dlv-grid  { display:grid; grid-template-columns:auto 1fr; gap:1px 6px; font-size:10px; }
+.dlv-grid span { color:var(--dim); }
+.dlv-grid b    { text-align:right; }
+
+/* Hover countdown / route progress. Width is the only thing JS touches. */
+.dlv-bar-wrap { height:3px; background:var(--edge); border-radius:2px;
+                margin-top:6px; overflow:hidden; display:none; }
+.dlv-bar-wrap.on { display:block; }
+.dlv-bar { height:100%; width:0%; background:var(--cyan); transition:width .3s linear; }
+
+#sect-delivery button:disabled { opacity:.35; cursor:not-allowed; }
+.hd-badge {
+  font-size:9px; font-weight:700; padding:1px 5px; border-radius:3px;
+  background:var(--btn); color:var(--dim); border:1px solid var(--btn-edge);
+}
+
+/* ---------- delivery: order inbox ---------- */
+/* The inbox is the answer to "I placed an order, did it arrive?" - every order
+   the app has written shows up here whether or not anyone accepts it. */
+.dlv-count {
+  font-size:9px; font-weight:700; padding:0 4px; border-radius:7px;
+  background:var(--btn); color:var(--dim); border:1px solid var(--btn-edge);
+}
+.dlv-count.has { background:var(--amberbg); color:var(--amber); border-color:var(--amber); }
+.icon-btn {
+  background:none; border:none; color:var(--dim); cursor:pointer;
+  font-size:12px; padding:0 2px; line-height:1;
+}
+.icon-btn:hover { color:var(--cyan); }
+.icon-btn.spin { animation:dlv-spin .6s linear; }
+@keyframes dlv-spin { to { transform:rotate(360deg); } }
+
+.dlv-inbox { max-height:112px; overflow-y:auto; margin-bottom:6px; }
+.dlv-inbox:empty { display:none; }
+.dlv-row {
+  display:grid; grid-template-columns:1fr auto; gap:0 6px;
+  align-items:center; padding:4px 5px; margin-bottom:3px;
+  background:var(--panel2); border:1px solid var(--edge);
+  border-left:2px solid var(--dim2);
+  border-radius:4px; cursor:pointer; font-size:10px;
+}
+.dlv-row:hover { background:var(--btn-h); border-color:var(--edge2); }
+.dlv-row.sel   { border-left-color:var(--cyan); background:var(--btn-h); }
+.dlv-row.blocked { cursor:not-allowed; opacity:.55; border-left-color:var(--red); }
+.dlv-row.done  { opacity:.5; cursor:default; border-left-color:var(--green); }
+.dlv-row-id   { font-weight:700; color:var(--txt); overflow:hidden;
+                text-overflow:ellipsis; white-space:nowrap; }
+.dlv-row-dist { color:var(--cyan); font-variant-numeric:tabular-nums; }
+.dlv-row-sub  { grid-column:1 / -1; color:var(--dim); font-size:9px;
+                overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.dlv-empty { font-size:10px; color:var(--dim); padding:6px 2px; }
+
+/* Phase timeline: ORDER -> LAUNCH -> EN ROUTE -> HOVER -> RETURN -> HOME */
+.dlv-track { display:flex; align-items:center; gap:3px; margin:5px 0 6px; }
+.dlv-step  { flex:1; height:3px; border-radius:2px; background:var(--edge); position:relative; }
+.dlv-step.on   { background:var(--cyan); }
+.dlv-step.done { background:var(--green); }
+.dlv-step.bad  { background:var(--red); }
+.dlv-track-labels { display:flex; justify-content:space-between;
+                    font-size:8px; color:var(--dim2); letter-spacing:.4px; }
+
+.dlv-setup {
+  font-size:9px; line-height:1.4; color:var(--amber);
+  background:var(--amberbg); border:1px solid var(--amber);
+  border-radius:4px; padding:5px 6px; margin-top:6px; display:none;
+}
+.dlv-setup.on { display:block; }
+.dlv-setup code { color:var(--txt); font-size:9px; }
+
+/* Bottom panel: the whole order book. */
+.dlv-book { font-size:10px; overflow-y:auto; max-height:100%; }
+.dlv-book table { width:100%; border-collapse:collapse; }
+.dlv-book th {
+  text-align:left; font-size:9px; color:var(--dim); font-weight:600;
+  letter-spacing:.5px; padding:2px 4px; border-bottom:1px solid var(--edge);
+  position:sticky; top:0; background:var(--panel);
+}
+.dlv-book td { padding:2px 4px; border-bottom:1px solid var(--panel2); }
+.dlv-book tr.live td { color:var(--cyan); }
+.dlv-book tr.pick { cursor:pointer; }
+.dlv-book tr.pick:hover td { background:var(--btn-h); }
+.pill {
+  font-size:8px; font-weight:700; padding:1px 4px; border-radius:3px;
+  background:var(--btn); color:var(--dim); border:1px solid var(--btn-edge);
+}
+.pill.dispatched { background:var(--amberbg); color:var(--amber); border-color:var(--amber); }
+.pill.delivered  { background:var(--greenbg); color:var(--green); border-color:var(--green); }
+.pill.cancelled  { background:var(--redbg);   color:var(--red);   border-color:var(--red); }
+.pill.flying     { background:var(--greenbg); color:var(--cyan);  border-color:var(--cyan); }
+.pill.aborted, .pill.rejected { background:var(--redbg); color:var(--red); border-color:var(--red); }
+
+.repeat-btn {
+  font-size:9px; font-weight:600; padding:1px 6px; border-radius:3px;
+  background:var(--btn); color:var(--dim); border:1px solid var(--btn-edge);
+  cursor:pointer; white-space:nowrap;
+}
+.repeat-btn:hover { color:var(--cyan); border-color:var(--cyan); }
+
+/* Map: the drop point and the leg the aircraft is flying to reach it. */
+.dlv-target-icon {
+  width:22px; height:22px; border-radius:50%;
+  border:2px solid var(--cyan); background:rgba(34,211,238,.18);
+  display:flex; align-items:center; justify-content:center;
+  font-size:12px; color:var(--cyan); box-shadow:0 0 10px rgba(34,211,238,.5);
+}
+.dlv-target-icon.hovering { animation:dlv-pulse 1.4s ease-in-out infinite; }
