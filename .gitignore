@@ -29,3 +29,24 @@ pyhailort.log
 # ad-hoc backup copies left alongside edited files
 *.bak_*
 *.bak.*
+
+# Firebase service-account private key: full project access, never commit it.
+config/firebase-service-account.json
+config/*service-account*.json
+config/pending_order.json
+
+# ad-hoc pre-edit snapshots left alongside edited files by editor sessions
+*.pre-*
+*.claude-bak
+*.prof-bak
+*.3m-profile-*
+.backup_delivery/
+backup-*/
+
+# stale duplicate of config/real.yaml left at the repo root
+/real.yaml
+
+# Live delivery state: contains real delivery tokens, recipient IDs and
+# customer GPS coordinates. Never commit.
+drone_stack/ble_handshake/active_order*.json
+drone_stack/ble_handshake/receipts/
