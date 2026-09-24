@@ -31,8 +31,19 @@ from drone_stack.utils.config import Config
 
 
 # -- helpers -----------------------------------------------------------------
+#: These files assert angles computed from a STATED safety radius - the
+#: docstrings say things like "a 1 m safety radius blocks asin(1/2) = 30 deg" -
+#: so the radius has to be pinned here rather than inherited from whichever
+#: profile Config.load() resolves. It was inherited until 2026-09-19, and
+#: raising the shipped radius (1.0 -> 1.6 in default.yaml, 2.5 in real.yaml, so
+#: that VFH+ stops steering to miss by less than the brake distance) silently
+#: closed the very corridors these tests exist to prove are flyable.
+_VFH_GEOMETRY = {"avoidance_vfh_safety_radius_m": 1.0}
+
+
 def _cfg(**overrides) -> Config:
     raw = copy.deepcopy(Config.load().raw)
+    raw.setdefault("navigation", {}).update(_VFH_GEOMETRY)
     for name, values in overrides.items():
         raw.setdefault(name, {}).update(values)
     return Config(raw)
@@ -218,7 +229,13 @@ def test_dodge_direction_is_latched_across_ticks():
 
 
 def test_dodge_stops_when_the_chosen_side_closes_in():
-    node, sent = _nav()
+    """Legacy three-cone path: the committed side closing in ends the dodge.
+
+    Pinned with VFH+ off so this keeps testing the sidestep it was written
+    for. The VFH+ path reaches the same stop by a different route and is
+    covered by the companion test below.
+    """
+    node, sent = _nav(navigation={"avoidance_vfh_enabled": False})
     node._obstacles = _obs((1.0, 0.0), (9.0, -90.0), (1.0, 90.0))
     node._do_avoid()
     assert node._dodge_dir == DODGE_LEFT
@@ -228,6 +245,26 @@ def test_dodge_stops_when_the_chosen_side_closes_in():
     assert node._dodge_dir is None
     assert sent[-1].command == "brake"
     assert "blocked" in node._status_message
+
+
+def test_vfh_stops_when_the_field_closes_in():
+    """Same encounter under VFH+, which stops for a stronger reason.
+
+    The three-cone dodge stops because the ONE side it committed to closed.
+    VFH+ re-solves the whole window every tick, so it stops only when no
+    flyable gap remains anywhere in the 250 deg the LiDAR can see - and it
+    still brakes rather than reversing into the masked rear.
+    """
+    node, sent = _nav()
+    node._obstacles = _obs((1.0, 0.0), (9.0, -90.0), (1.0, 90.0))
+    node._do_avoid()
+    assert node._dodge_dir is not None
+    node._obstacles = _obs((1.0, 0.0), (0.8, -90.0), (1.0, 90.0))
+    node._do_avoid()
+    assert node._dodge_dir is None
+    assert node._dodge_heading is None
+    assert sent[-1].command == "brake"
+    assert "no flyable gap" in node._status_message
 
 
 def test_dodge_times_out_into_a_hold():
@@ -293,3 +330,119 @@ def test_absent_sector_reports_zero_not_infinity():
     status = node.bus.latest(Topics.AVOIDANCE)
     assert status.left_m == 0.0 and status.right_m == 0.0
     assert status.front_m == 1.0
+
+
+# -- VFH+ course -> velocity, and the state it carries -----------------------
+def test_a_course_behind_the_wing_never_commands_reverse_thrust():
+    """The forward component is cos(heading), and cos goes negative past 90.
+
+    ``choose_heading`` is allowed to return up to +/-(fov_half_deg - half a
+    minimum valley) = +/-116 deg, and does whenever the waypoint sits behind
+    the wing - which an overshooting dodge and the whole RTL leg both produce.
+    Resolved naively, ``dodge_speed * cos(116 deg)`` is -0.44 m/s, and a
+    negative vx in MAV_FRAME_BODY_NED is the aircraft reversing into the
+    110 deg the LiDAR does not see.
+
+    The field below is the reachable case: five returns at 3 m spaced closely
+    enough that their enlarged arcs seal -95..+95 deg, leaving only the two
+    outer valleys, while the front cone stays 3 m clear so forward speed IS
+    earned (margin 1.8 m) and both side cones stay well outside the brake.
+    Every guard upstream is satisfied; only the clamp stands between this and
+    a commanded back-up.
+    """
+    node, sent = _nav()
+    node._goal_bearing_deg = lambda: 180.0          # waypoint dead astern
+    node._obstacles = _obs(
+        (3.0, -78.0), (3.0, -39.0), (3.0, 0.0), (3.0, 39.0), (3.0, 78.0))
+
+    node._dodge_step(3.0)
+
+    assert abs(node._dodge_heading) > 90.0, (
+        "field no longer forces a rear-quadrant course - the test has stopped "
+        f"exercising the clamp (heading {node._dodge_heading})")
+    vel = [c for c in sent if c.command == "velocity"]
+    assert vel, "expected the dodge to command a velocity"
+    assert all(c.params["vx"] >= 0.0 for c in vel), (
+        f"commanded reverse thrust: {[c.params['vx'] for c in vel]}")
+    # Still a real manoeuvre - the lateral component is untouched.
+    assert abs(vel[-1].params["vy"]) > 0.5
+
+
+def test_the_latched_side_follows_the_course_across_the_nose():
+    """_dodge_dir labels the side being flown, not the side picked at entry.
+
+    The course is re-solved every tick and crosses the nose when the goal
+    bearing moves. The "chosen side closed in" guard reads
+    ``view.left``/``view.right`` off _dodge_dir, so a stale side makes it check
+    the clearance of a side the aircraft is no longer flying toward.
+    """
+    node, sent = _nav()
+    goal = [60.0]
+    node._goal_bearing_deg = lambda: goal[0]
+    node._obstacles = _obs((3.0, 0.0))       # only the nose is blocked
+
+    node._dodge_step(3.0)
+    assert node._dodge_dir == DODGE_RIGHT
+    assert node._dodge_heading > 0.0
+
+    # Waypoint swings to the other side. Age the timestamp so the slew limiter
+    # has the budget to actually get there rather than creeping 4.5 deg.
+    goal[0] = -60.0
+    node._dodge_heading_t -= 10.0
+    node._dodge_step(3.0)
+
+    assert node._dodge_heading < 0.0, "course should have crossed the nose"
+    assert node._dodge_dir == DODGE_LEFT, (
+        "latched side still points at the course we abandoned")
+
+
+def test_braking_into_avoid_drops_the_previous_vfh_course():
+    """_do_navigate clears the dodge state on STOP; the course is part of it.
+
+    Carried over, it seeds the next encounter's hysteresis with a bearing
+    solved against obstacles that have since gone - the exact "decided against
+    a stale scan" the reset exists to prevent.
+    """
+    node, _ = _nav()
+    node._dodge_heading = 42.0
+    node._dodge_heading_t = 1.0
+    node._obstacles = _obs((1.0, 0.0))       # inside the brake distance
+
+    node._do_navigate()
+
+    assert node._dodge_dir is None
+    assert node._dodge_heading is None
+    assert node._dodge_heading_t is None
+
+
+def test_the_panel_predicts_the_route_the_aircraft_would_actually_fly():
+    """_publish_avoidance draws the escape route before the dodge starts.
+
+    Asking the three-cone dodge while VFH+ is steering paints a side the
+    aircraft will not take. Here they genuinely disagree: the right cone is
+    emptier so the three-cone dodge picks it, while the waypoint is off to the
+    left and VFH+ has a wide flyable valley there.
+    """
+    node, _ = _nav()
+    node._goal_bearing_deg = lambda: -60.0
+    node._obstacles = _obs((3.0, 0.0), (4.0, -100.0))
+    view = node._avoider.sectors(node._obstacles)
+
+    assert node._avoider.dodge(view) == DODGE_RIGHT      # emptier cone
+    assert node._predicted_dodge(view) == DODGE_LEFT     # where the goal is
+
+
+def test_the_panel_reports_trapped_when_vfh_has_no_gap():
+    node, _ = _nav()
+    node._obstacles = _obs(*[(1.5, b) for b in range(-120, 121, 10)])
+    view = node._avoider.sectors(node._obstacles)
+
+    assert node._predicted_dodge(view) == DODGE_TRAPPED
+
+
+def test_the_panel_still_uses_the_three_cone_dodge_when_vfh_is_off():
+    node, _ = _nav(navigation={"avoidance_vfh_enabled": False})
+    node._obstacles = _obs((3.0, 0.0), (4.0, -100.0))
+    view = node._avoider.sectors(node._obstacles)
+
+    assert node._predicted_dodge(view) == node._avoider.dodge(view)

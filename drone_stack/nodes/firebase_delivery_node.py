@@ -33,8 +33,10 @@ Safety posture, in order of how much it matters:
 """
 from __future__ import annotations
 
+from pathlib import Path
 import threading
 import time
+import typing
 from typing import Any
 
 from drone_stack.bus.message_bus import MessageBus
@@ -45,13 +47,17 @@ from drone_stack.interfaces.firebase_interface import (
     build_order_source,
 )
 from drone_stack.msg import (
+    DeliveryBleResult,
     DeliveryOrder,
+    DeliveryOutcome,
     DeliveryPhase,
     DeliveryState,
     GpsFix,
     MissionPhase,
     MissionUploadResult,
     NavCommand,
+    ReturnOutcome,
+    describe_outcome,
 )
 from drone_stack.srv.services import ServiceRegistry, ServiceRequest, ServiceResponse
 from drone_stack.utils.config import Config
@@ -91,6 +97,10 @@ class FirebaseDeliveryNode(NodeBase):
         self._hover_alt = float(section.get("hover_altitude_m", 2.0))
         self._upload_to_fc = bool(section.get("upload_to_fc", True))
         self._write_back = bool(section.get("write_back", True))
+        #: How close to home counts as "returned". Measured from the navigator's
+        #: home, not the order's target, and only read once the aircraft is
+        #: down - it answers "did someone have to go and fetch it?".
+        self._home_radius = float(section.get("home_radius_m", 15.0))
 
         self._lock = threading.RLock()
         self._state = DeliveryState(link=LINK_DISABLED)
@@ -110,6 +120,23 @@ class FirebaseDeliveryNode(NodeBase):
         self._inbox: list[DeliveryOrder] = []     # dispatchable, oldest first
         self._selected = ""                       # operator's explicit choice
         self._ever_armed = False                  # did this delivery get airborne?
+        # ── outcome evidence, reset per delivery ────────────────────────────
+        #: Order ids whose BLE drop gate passed. This is the ONLY evidence of
+        #: an actual handover: the payload servo is not instrumented (see
+        #: parcel_delivery/pi/payload_controller.py), so "the aircraft came
+        #: home" says nothing about whether the parcel left it.
+        self._ble_ok: set[str] = set()
+        #: Mission phases actually traversed while airborne. RTL distinguishes
+        #: "flew itself home" from "put itself down where it stood", which the
+        #: final position alone cannot - an emergency landing that happens to
+        #: be near home is still not a return.
+        self._saw_rtl = False
+        self._saw_land = False
+        self._saw_emergency = False
+        #: Set when something deliberately ended the delivery early (operator
+        #: ABORT, pilot takeover, a failsafe), as opposed to it simply failing
+        #: to get a handshake at the drop point.
+        self._abort_reason = ""
         self._recent: list[DeliveryOrder] = []    # any status, newest first
         # Local record of every order's final outcome, keyed by order_id.
         # list_recent() only knows what Firestore knows, so a manually
@@ -129,6 +156,9 @@ class FirebaseDeliveryNode(NodeBase):
         self.subscribe(Topics.GPS, self._on_gps)
         self.subscribe(Topics.MISSION_UPLOAD, self._on_upload_result)
         self.subscribe(Topics.MISSION_STATE, self._on_mission_state)
+        self.subscribe(
+            Topics.DELIVERY_BLE_RESULT, self._on_ble_result, deliver_latched=False
+        )
 
         self.services.register("delivery_accept", self._svc_accept)
         self.services.register("delivery_reject", self._svc_reject)
@@ -187,6 +217,29 @@ class FirebaseDeliveryNode(NodeBase):
         if getattr(msg, "home_set", False):
             with self._lock:
                 self._home = (msg.home_lat, msg.home_lon)
+
+    def _on_ble_result(self, msg) -> None:
+        """Record the recipient handshake - the proof a parcel changed hands.
+
+        NavigationNode already consumes this to cut the hover short. This node
+        needs it for a different reason: without it the delivery phase can only
+        report what the AIRCRAFT did, so a flight that never got a valid
+        handshake and came home with the parcel still aboard was published as
+        "delivery complete".
+
+        Recorded by order id rather than as a flag so a result that arrives
+        slightly out of step with the active order cannot credit the wrong one.
+        """
+        if not isinstance(msg, DeliveryBleResult) or not msg.success:
+            return
+        order_id = str(msg.order_id or "")
+        if not order_id:
+            return
+        with self._lock:
+            self._ble_ok.add(order_id)
+            if self._state.order_id == order_id:
+                self._state.ble_verified = True
+        self.log.info("BLE drop gate passed for order %s", order_id)
 
     def _on_upload_result(self, msg) -> None:
         if isinstance(msg, MissionUploadResult):
@@ -362,9 +415,27 @@ class FirebaseDeliveryNode(NodeBase):
         if d.get("armed"):
             self._ever_armed = True
 
+        # The mission being over is a different question from the delivery
+        # phase reading "finished". An aborted delivery whose aircraft is still
+        # flying home is not over, and that gap is exactly where the
+        # "aborted + returned" outcome lives.
+        mission_terminal = phase in {p.value for p in _TERMINAL}
+
+        # Which legs actually happened. Position alone cannot tell "flew itself
+        # home" from "put itself down where it stood" - an emergency landing
+        # that happens to be near home is still not a return.
+        if phase == MissionPhase.RTL.value:
+            self._saw_rtl = True
+        elif phase == MissionPhase.LAND.value:
+            self._saw_land = True
+        elif phase == MissionPhase.EMERGENCY.value:
+            self._saw_emergency = True
+
         if d.get("pilot_override"):
             new_phase = DeliveryPhase.ABORTED
             message = f"pilot took control ({d.get('mode', '?')}) - delivery halted"
+            if not self._abort_reason:
+                self._abort_reason = f"pilot took control ({d.get('mode', '?')})"
         elif phase == MissionPhase.ARMING.value:
             # The autopilot may legitimately refuse for a while. Show its own
             # words rather than a silent "accepted, nothing happening".
@@ -393,7 +464,7 @@ class FirebaseDeliveryNode(NodeBase):
         elif phase in (MissionPhase.LAND.value, MissionPhase.EMERGENCY.value):
             new_phase = DeliveryPhase.RETURNING
             message = str(status.message or "landing")
-        elif phase in (p.value for p in _TERMINAL):
+        elif mission_terminal:
             if self._ever_armed:
                 new_phase = DeliveryPhase.LANDED
                 message = "delivery complete - drone home and disarmed"
@@ -415,25 +486,29 @@ class FirebaseDeliveryNode(NodeBase):
         if new_phase == DeliveryPhase.ABORTED and refusal:
             with self._lock:
                 self._state.last_error = refusal
+
+        # An abort is sticky. The aircraft usually keeps flying - home, or
+        # wherever the pilot takes it - and the RTL leg used to overwrite the
+        # abort with RETURNING, so the panel lost the fact that a human had
+        # stopped the delivery at all.
+        if self._abort_reason:
+            new_phase = DeliveryPhase.ABORTED
+            if not mission_terminal:
+                message = f"{self._abort_reason} · {message}"
+
         returning = new_phase == DeliveryPhase.RETURNING
         with self._lock:
             self._state.hover_remaining_s = round(hover_remaining, 1)
             self._state.remaining_m = round(self._remaining_m(active, returning), 1)
             self._set_phase(new_phase, message, order=active)
-            if new_phase in (DeliveryPhase.LANDED, DeliveryPhase.ABORTED):
-                if new_phase is DeliveryPhase.LANDED or self._ever_armed:
-                    # A flight that happened is finished either way. One that
-                    # never armed failed on a precondition - no position
-                    # estimate, a refused arm, a failsafe on the pad - none of
-                    # which are properties of the order, so burning its id
-                    # stranded a good delivery until the service restarted.
-                    self._handled.add(active.order_id)
-                self._record_history(active, new_phase.value)
-                self._active = None
-                self._pending = None
-                self.log.info(
-                    "order %s finished: %s", active.order_id, new_phase.value
-                )
+            # Finish on the MISSION ending, not on the delivery phase looking
+            # final - otherwise an abort closes the order the instant it is
+            # pressed and nothing ever observes whether the aircraft got home.
+            never_launched = not self._ever_armed and new_phase in (
+                DeliveryPhase.ABORTED, DeliveryPhase.LANDED
+            )
+            if mission_terminal or never_launched:
+                self._finish_delivery(active, new_phase)
 
     # -- accept / reject -----------------------------------------------------
     def _validate(self, order: DeliveryOrder) -> tuple[bool, str, bool]:
@@ -533,7 +608,7 @@ class FirebaseDeliveryNode(NodeBase):
         with self._lock:
             self._active = order
             self._pending = None
-            self._ever_armed = False
+            self._reset_outcome_evidence()
             self._state.waypoints = waypoints
             self._state.distance_m = round(distance, 1)
             self._state.fc_mission_uploaded = uploaded
@@ -594,6 +669,12 @@ class FirebaseDeliveryNode(NodeBase):
             self._set_phase(
                 DeliveryPhase.REJECTED, f"rejected: {reason}", order=order
             )
+        try:
+            for p in [Path.home() / "drone_stack" / "active_order.json", Path.cwd() / "active_order.json"]:
+                if p.exists():
+                    p.unlink()
+        except Exception:
+            pass
         self.log.warning("order %s rejected: %s", order.order_id, reason)
 
     # -- services ------------------------------------------------------------
@@ -676,8 +757,13 @@ class FirebaseDeliveryNode(NodeBase):
         response = self.services.call("abort_delivery")
         with self._lock:
             self._handled.add(order.order_id)
-            self._active = None
-            self._record_history(order, DeliveryPhase.ABORTED.value)
+            # _active is deliberately KEPT. The aircraft is still in the air and
+            # usually flying home, and only _track_active watching it to the
+            # ground can tell "aborted · returned home" from "aborted · did not
+            # return". Clearing it here closed the order the instant the button
+            # was pressed, so the return half of the outcome was never observed.
+            # _finish_delivery closes it once the mission actually ends.
+            self._abort_reason = "aborted by operator"
             self._set_phase(
                 DeliveryPhase.ABORTED,
                 response.message or "delivery aborted - returning home",
@@ -774,6 +860,158 @@ class FirebaseDeliveryNode(NodeBase):
         })
 
     # -- state ---------------------------------------------------------------
+    # -- outcome -------------------------------------------------------------
+    def _reset_outcome_evidence(self) -> None:
+        """Start a delivery with no opinion about how it went. Lock held.
+
+        ``_ble_ok`` is deliberately NOT cleared: it is keyed by order id, so it
+        cannot credit the wrong delivery, and keeping it means a handshake that
+        lands slightly before the accept is not thrown away.
+        """
+        self._ever_armed = False
+        self._saw_rtl = False
+        self._saw_land = False
+        self._saw_emergency = False
+        self._abort_reason = ""
+        s = self._state
+        s.outcome = DeliveryOutcome.PENDING
+        s.return_outcome = ReturnOutcome.PENDING
+        s.outcome_label = ""
+        s.outcome_reason = ""
+        s.outcome_at = 0.0
+        s.ble_verified = False
+        s.home_distance_m = 0.0
+        s.ever_armed = False
+
+    def _home_distance_m(self) -> float | None:
+        """How far the aircraft is from home, or None if that is not known."""
+        if self._pos is None or self._home is None:
+            return None
+        return haversine_m(
+            self._pos[0], self._pos[1], self._home[0], self._home[1]
+        )
+
+    def _classify_outcome(self) -> tuple[DeliveryOutcome, ReturnOutcome, str]:
+        """Split "how did it go?" into the parcel's answer and the aircraft's.
+
+        These are genuinely independent, and the panel was wrong precisely
+        because it published one word for both. A delivery can succeed while
+        the aircraft strands itself in a field, and the aircraft can come home
+        perfectly with the parcel never handed over.
+
+        Call with ``self._lock`` held.
+        """
+        order_id = self._state.order_id
+        delivered = bool(order_id) and order_id in self._ble_ok
+
+        # -- what happened to the parcel --------------------------------------
+        if delivered:
+            parcel = DeliveryOutcome.DELIVERED
+            why = "recipient handshake verified"
+        elif not self._ever_armed:
+            parcel = DeliveryOutcome.NEVER_FLEW
+            why = self._abort_reason or "never left the ground"
+        elif self._abort_reason:
+            parcel = DeliveryOutcome.ABORTED
+            why = self._abort_reason
+        else:
+            # Flew the whole leg and came back without a handshake. NOT the
+            # same as an abort, and emphatically not a completed delivery.
+            parcel = DeliveryOutcome.FAILED
+            why = "no valid recipient handshake at the drop point"
+
+        # -- what happened to the aircraft ------------------------------------
+        distance = self._home_distance_m()
+        if not self._ever_armed:
+            ret = ReturnOutcome.ON_PAD
+        elif self._saw_emergency or (self._saw_land and not self._saw_rtl):
+            # Put itself down rather than flying home. Where it stopped does
+            # not change that - someone still has to go and collect it.
+            ret = ReturnOutcome.NOT_RETURNED
+            why += " · put down without flying home"
+        elif distance is not None:
+            ret = (
+                ReturnOutcome.RETURNED
+                if distance <= self._home_radius
+                else ReturnOutcome.NOT_RETURNED
+            )
+            if ret is ReturnOutcome.NOT_RETURNED:
+                why += f" · down {distance:.0f} m from home"
+        elif self._saw_rtl:
+            # No position to judge by, but it did fly the return leg. Best
+            # available answer, and better than claiming ignorance.
+            ret = ReturnOutcome.RETURNED
+        else:
+            ret = ReturnOutcome.UNKNOWN
+        return parcel, ret, why
+
+    def _finish_delivery(
+        self, order: DeliveryOrder, phase: DeliveryPhase
+    ) -> None:
+        """Reach a verdict on a finished delivery and let the order go.
+
+        Call with ``self._lock`` held.
+        """
+        parcel, ret, why = self._classify_outcome()
+        distance = self._home_distance_m()
+        s = self._state
+        s.outcome = parcel
+        s.return_outcome = ret
+        s.outcome_label = describe_outcome(parcel, ret)
+        s.outcome_reason = why
+        s.outcome_at = time.time()
+        s.ble_verified = bool(s.order_id) and s.order_id in self._ble_ok
+        s.home_distance_m = round(distance, 1) if distance is not None else 0.0
+        s.home_radius_m = self._home_radius
+        s.ever_armed = self._ever_armed
+        if phase is DeliveryPhase.LANDED or self._ever_armed:
+            # A flight that happened is finished either way. One that never
+            # armed failed on a precondition - no position estimate, a refused
+            # arm, a failsafe on the pad - none of which are properties of the
+            # order, so burning its id stranded a good delivery until the
+            # service restarted.
+            self._handled.add(order.order_id)
+        # The order book now carries the verdict rather than the phase, so a
+        # finished row reads "DELIVERED · DID NOT RETURN" instead of "LANDED".
+        self._record_history(order, s.outcome_label)
+        self._write_outcome_back(order)
+        self._active = None
+        self._pending = None
+        self.log.info(
+            "order %s finished: %s (%s)", order.order_id, s.outcome_label, why
+        )
+
+    def _write_outcome_back(self, order: DeliveryOrder) -> None:
+        """Mirror the verdict onto the Firestore document, if enabled.
+
+        Written as three fields rather than one string so the app can branch on
+        the parcel and the aircraft separately - "we could not deliver" and
+        "your drone is in a field" are different notifications.
+        """
+        if not self._write_back:
+            return
+        doc_id = order.doc_id or order.order_id
+        if not doc_id:
+            return
+        s = self._state
+        fields = {
+            "droneOutcome": s.outcome.value,
+            "droneReturn": s.return_outcome.value,
+            "droneOutcomeLabel": s.outcome_label,
+            "droneOutcomeReason": s.outcome_reason,
+            "droneDelivered": s.outcome is DeliveryOutcome.DELIVERED,
+            "droneReturned": s.return_outcome is ReturnOutcome.RETURNED,
+            "droneUpdatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        if s.outcome is not DeliveryOutcome.DELIVERED:
+            fields["status"] = "CANCELED"
+        else:
+            fields["status"] = "DELIVERED"
+        try:
+            self._source.update_order(doc_id, fields)
+        except Exception:  # noqa: BLE001 - write-back is best effort
+            self.log.debug("outcome write-back failed", exc_info=True)
+
     def _distance_to(self, order: DeliveryOrder) -> float:
         """Route length: home to the drop point. Constant for a given order."""
         if self._home is None:
@@ -838,6 +1076,9 @@ class FirebaseDeliveryNode(NodeBase):
             "droneMessage": self._state.message,
             "droneUpdatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
+        if self._state.phase in (DeliveryPhase.REJECTED, DeliveryPhase.ABORTED):
+            fields["status"] = "CANCELED"
+            fields["droneOutcome"] = self._state.phase.value
         if self._state.phase == DeliveryPhase.LANDED:
             fields["droneDelivered"] = True
         try:
@@ -899,6 +1140,13 @@ class FirebaseDeliveryNode(NodeBase):
                     self._source.link, f"order source {self._source.link}"
                 )
             self._state.auto_accept = self._auto_accept
+            # The radius the return verdict is judged against, and the
+            # handshake flag, are both useful DURING a flight - the operator
+            # can see the drop was authorised before the aircraft is home.
+            self._state.home_radius_m = self._home_radius
+            self._state.ever_armed = self._ever_armed
+            if self._state.order_id:
+                self._state.ble_verified = self._state.order_id in self._ble_ok
             queued = {o.order_id for o in self._inbox}
             self._state.orders = [self._order_row(o, True) for o in self._inbox]
             # History minus anything already shown in the queue, so an order

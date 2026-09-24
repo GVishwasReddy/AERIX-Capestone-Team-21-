@@ -8,6 +8,7 @@ YAML files.
 """
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 
 import pytest
@@ -107,3 +108,25 @@ def write_config_dir(base: Path, overrides: dict | None = None) -> Path:
 @pytest.fixture
 def valid_config_dir(tmp_path: Path) -> Path:
     return write_config_dir(tmp_path)
+
+
+@pytest.fixture
+def missing_hef_config_dir(tmp_path: Path) -> Path:
+    """``valid_config_dir``, but with hef paths that cannot exist anywhere.
+
+    ``MODELS`` points at repo-root-relative ``models/*.hef``. That resolves to
+    NOTHING on a Mac checkout and to the REAL 7 MB weights on the Pi, which ships
+    them - so a test that used the shared fixture to assert "degrades gracefully
+    without Hailo" was really asserting "this is a dev machine". It passed on the
+    Mac and failed on the aircraft (2026-08-31), which is the wrong way round for
+    a stack whose whole point is the aircraft.
+
+    Same failure mode as the ``test_adapters.py`` fix on 2026-08-14: pin the
+    environment instead of assuming it. These paths sit under a directory inside
+    tmp_path that is never created, so "no model on disk" is true on every
+    machine and the degradation path is genuinely exercised.
+    """
+    models = copy.deepcopy(MODELS)
+    for name, spec in models["models"].items():
+        spec["hef_path"] = str(tmp_path / "no_such_dir" / f"{name}.hef")
+    return write_config_dir(tmp_path, overrides={"models.yaml": models})

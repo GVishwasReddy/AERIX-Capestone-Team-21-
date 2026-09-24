@@ -6,12 +6,16 @@ scan data — no lidar hardware and no MAVLink connection required.
 import pytest
 
 from lidar_bridge import (
+    DEFAULT_FOV_DEG,
     DISTANCE_UNKNOWN,
     SECTOR_COUNT,
     SECTOR_WIDTH_DEG,
+    LidarBridge,
     parse_measurement_nodes,
     scan_to_distances,
+    sector_keep_mask,
     to_pymavlink_connection,
+    wrap_180,
 )
 
 
@@ -237,3 +241,136 @@ class TestNodeParser:
         readings = [(angle, dist) for _s, angle, dist in nodes]
         distances = build(readings)
         assert all(d == 250 for d in distances)
+
+
+class TestWrap180:
+    @pytest.mark.parametrize(
+        "raw, expected",
+        # Range is [-180, 180), so 180 folds to -180. Immaterial to the mask,
+        # which only ever reads abs(), but pin it down rather than leave it open.
+        [(0.0, 0.0), (90.0, 90.0), (180.0, -180.0), (181.0, -179.0),
+         (270.0, -90.0), (360.0, 0.0), (-90.0, -90.0), (-270.0, 90.0)],
+    )
+    def test_folds_onto_the_symmetric_range(self, raw, expected):
+        assert wrap_180(raw) == pytest.approx(expected)
+
+
+class TestSectorKeepMask:
+    """The rear wedge must never reach the flight controller.
+
+    The C1 spins a full circle, but the rear of that circle is the airframe's
+    own tail and whatever the drone is parked next to — stationary returns that
+    make ArduPilot brake for the vehicle itself.
+    """
+
+    def test_default_window_matches_drone_stack(self):
+        # 250 deg, judged on sector centres: 0-24 and 47-71 kept, 25-46 masked.
+        keep = sector_keep_mask()
+        assert len(keep) == SECTOR_COUNT
+        assert sum(keep) == 50
+        assert all(keep[i] for i in range(0, 25))
+        assert not any(keep[i] for i in range(25, 47))
+        assert all(keep[i] for i in range(47, SECTOR_COUNT))
+
+    def test_masked_arc_is_the_rear_110_degrees(self):
+        masked = [i for i, ok in enumerate(sector_keep_mask()) if not ok]
+        assert len(masked) * SECTOR_WIDTH_DEG == 360.0 - DEFAULT_FOV_DEG
+
+    def test_mask_is_symmetric_about_the_nose(self):
+        # Sector i and its mirror (72 - 1 - i) look the same distance off the
+        # nose, so a left/right handedness slip would show up here.
+        keep = sector_keep_mask()
+        for i in range(SECTOR_COUNT):
+            assert keep[i] == keep[(SECTOR_COUNT - 1 - i)]
+
+    def test_nose_and_tail(self):
+        keep = sector_keep_mask()
+        assert keep[0] is True                      # straight ahead
+        assert keep[SECTOR_COUNT // 2] is False     # straight behind
+
+    def test_disabled_keeps_the_full_circle(self):
+        assert sector_keep_mask(DEFAULT_FOV_DEG, enabled=False) == [True] * SECTOR_COUNT
+
+    def test_360_degrees_is_not_a_mask(self):
+        assert sector_keep_mask(360.0) == [True] * SECTOR_COUNT
+
+    def test_narrower_window_keeps_fewer_sectors(self):
+        assert sum(sector_keep_mask(180.0)) == 36
+        assert sum(sector_keep_mask(90.0)) == 18
+
+    def test_zero_degrees_keeps_nothing(self):
+        assert sum(sector_keep_mask(0.0)) == 0
+
+    def test_boundary_sector_is_kept(self):
+        # Sector 24's centre is 122.5 deg, inside a 125 deg half-window; 25's
+        # is 127.5 and outside. An off-by-one here silently narrows the view.
+        keep = sector_keep_mask()
+        assert keep[24] is True
+        assert keep[25] is False
+
+
+class TestMaskedBucketing:
+    def test_rear_beams_cannot_reach_the_flight_controller(self):
+        keep = sector_keep_mask()
+        # 180 deg = directly behind, well inside the masked wedge.
+        distances = build([(180.0, 1.0)], keep=keep)
+        assert distances[36] == DISTANCE_UNKNOWN
+        assert distances == [DISTANCE_UNKNOWN] * SECTOR_COUNT
+
+    def test_masked_sector_stays_unknown_not_far(self):
+        # UNKNOWN, not a large distance: a fake "nothing for 12 m" reading
+        # would be a claim about ground the sensor never scanned.
+        keep = sector_keep_mask()
+        assert build([(180.0, 0.3)], keep=keep)[36] == DISTANCE_UNKNOWN
+
+    def test_front_beams_are_unaffected(self):
+        keep = sector_keep_mask()
+        assert build([(0.0, 5.0)], keep=keep)[0] == 500
+        assert build([(120.0, 3.0)], keep=keep)[24] == 300
+        assert build([(240.0, 3.0)], keep=keep)[48] == 300
+
+    def test_uniform_wall_only_fills_the_scanned_window(self):
+        keep = sector_keep_mask()
+        scan = [(float(a), 4.0) for a in range(360)]
+        distances = build(scan, keep=keep)
+        assert sum(1 for d in distances if d == 400) == 50
+        assert sum(1 for d in distances if d == DISTANCE_UNKNOWN) == 22
+
+    def test_no_mask_is_the_old_behaviour(self):
+        scan = [(float(a), 4.0) for a in range(360)]
+        assert all(d == 400 for d in build(scan))
+        assert build(scan) == build(scan, keep=None)
+
+    def test_mask_is_applied_after_the_mounting_offset(self):
+        # A beam 180 deg off the RAW front is only "behind the aircraft" once
+        # the mounting offset has been applied. With a +90 deg offset the beam
+        # that ends up behind is the one the lidar calls 90 deg.
+        keep = sector_keep_mask()
+        assert build([(90.0, 1.0)], angle_offset_deg=90.0, keep=keep) == (
+            [DISTANCE_UNKNOWN] * SECTOR_COUNT
+        )
+        assert build([(180.0, 1.0)], angle_offset_deg=90.0, keep=keep)[54] == 100
+
+
+class TestBridgeMaskWiring:
+    """The mask has to be built into the bridge, not just available to it."""
+
+    def _bridge(self, **kwargs):
+        return LidarBridge(
+            mavlink_connection="udp://:14540",
+            lidar_port="/dev/null",
+            **kwargs,
+        )
+
+    def test_mask_is_on_by_default(self):
+        assert self._bridge()._keep == sector_keep_mask()
+
+    def test_mask_can_be_disabled(self):
+        assert self._bridge(fov_enabled=False)._keep == [True] * SECTOR_COUNT
+
+    def test_custom_window_is_honoured(self):
+        assert self._bridge(fov_deg=180.0)._keep == sector_keep_mask(180.0)
+
+    def test_mask_is_built_once_not_per_scan(self):
+        bridge = self._bridge()
+        assert bridge._keep is bridge._keep

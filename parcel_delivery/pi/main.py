@@ -87,6 +87,8 @@ class DeliveryService:
                 mavlink_connection=self.config.lidar_mavlink_connection,
                 lidar_port=self.config.lidar_port,
                 lidar_baud=self.config.lidar_baud,
+                fov_enabled=self.config.lidar_fov_enabled,
+                fov_deg=self.config.lidar_fov_deg,
             )
             try:
                 self.lidar.start()

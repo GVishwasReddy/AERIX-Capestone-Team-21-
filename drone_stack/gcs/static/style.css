@@ -1,301 +1,802 @@
-/* ===================== Drone GCS theme ===================== */
+/* =========================================================================
+   AERIX GCS — design system v3
+   Three influences, deliberately blended:
+     · glass + depth   — layered translucent surfaces, real shadows, hover lift
+     · hard avionics   — hairline rules, bezelled instruments, engraved labels
+     · mission control — one primary flight band in large tabular numerals
+   ------------------------------------------------------------------------
+   EVERYTHING IS SIZED OFF ONE UNIT. --u is one scaled pixel; the header
+   density button writes <html data-density> and the whole UI rescales. Add new
+   sizes as calc(N * var(--u)) or they will not follow it.
+   ========================================================================= */
+
+/* ---------- density + viewport scale ----------
+   --u is ONE SCALED PIXEL. Every size in this file is a multiple of it:
+   calc(N * var(--u)). It is a LENGTH, not a ratio, and that is deliberate.
+
+   The obvious design - a unitless --sc used as calc(Npx * var(--sc)) - cannot
+   be made fluid. Nothing unitless can see the viewport: clamp(.78, .727 +
+   .0147vw, 1.08) adds a number to a length and is INVALID, which silently
+   kills every single size in the file, and CSS will not divide two lengths
+   back into a ratio either. Scaling the unit sidesteps both: clamp() over
+   lengths is legal, so --u tracks the viewport continuously with no breakpoint
+   steps, and number * length is legal, so call sites stay readable.
+
+   --dsc is the operator's density preference, multiplied on top. It MUST be
+   set on :root. A custom property is substituted where it is DECLARED, so
+   --dsc on body would read back correctly via getComputedStyle and still
+   change nothing on screen - the :root-declared --u would never re-resolve.
+   app.js writes document.documentElement.dataset.density.
+
+   Add new sizes as calc(N * var(--u)) or they will not scale. */
+:root {
+  --dsc:1;
+  /* .78px at a 360px viewport -> 1.08px at 2400px, linear in between */
+  --u:calc(var(--dsc) * clamp(0.78px, calc(0.727px + 0.0147vw), 1.08px));
+}
+:root[data-density="compact"] { --dsc:.87; }
+:root[data-density="normal"]  { --dsc:1; }
+:root[data-density="roomy"]   { --dsc:1.15; }
+
+/* ---------- tokens: dark (default) ---------- */
 :root, body[data-theme="dark"] {
-  --bg:#070b0e; --bg2:#0b1116; --panel:#0c141a; --panel2:#0a1015;
-  --edge:#16242e; --edge2:#1d3340;
-  --txt:#cfe0e8; --dim:#5f7488; --dim2:#3a5566;
-  --green:#38e07b; --greenbg:#0e2a1c; --cyan:#22d3ee;
-  --red:#ff4d4f; --redbg:#2a1113; --amber:#f2b34a; --amberbg:#2a2110;
-  --warn:#f2b34a;
-  --btn:#0f1a22; --btn-h:#152530; --btn-edge:#1d3340;
+  --bg:#000000; --bg2:#050506;
+  --surf-1:#0a0a0c; --surf-2:#101013; --surf-3:#17181b; --surf-4:#1f2126;
+  --panel:var(--surf-1); --panel2:#050506;
+  --line:#1d1f24; --line-2:#2a2d33; --line-3:#3b3f47;
+  --edge:var(--line); --edge2:var(--line-2);
+  --txt:#e6ebf0; --dim:#8b939d; --dim2:#565e68;
+  --green:#3ddc84; --greenbg:#08241a; --green-gl:rgba(61,220,132,.32);
+  --cyan:#35d6f2;  --cyanbg:#062630;  --cyan-gl:rgba(53,214,242,.32);
+  --amber:#ffb340; --amberbg:#2a1d0c; --amber-gl:rgba(255,179,64,.32);
+  --red:#ff4f60;   --redbg:#2a0f14;   --red-gl:rgba(255,79,96,.34);
+  --violet:#a78bfa; --violet-gl:rgba(167,139,250,.30);
+  --warn:var(--amber);
+  --btn:var(--surf-3); --btn-h:var(--surf-4); --btn-edge:var(--line-2);
+  --focus:var(--cyan);
+  --e1:0 1px 2px rgba(0,0,0,.55);
+  --e2:0 3px 10px -2px rgba(0,0,0,.62), 0 1px 2px rgba(0,0,0,.5);
+  --e3:0 20px 56px -12px rgba(0,0,0,.85);
+  --sheen:inset 0 1px 0 rgba(255,255,255,.055);
+  --bezel:inset 0 0 0 1px rgba(255,255,255,.035), inset 0 2px 6px rgba(0,0,0,.6);
+  --glass:rgba(6,6,8,.80);
+  --scan:rgba(255,255,255,.013);
+  --grid-ink:rgba(190,215,235,.026);
 }
 body[data-theme="light"] {
-  --bg:#e8edf0; --bg2:#dde5ea; --panel:#f4f7f9; --panel2:#ffffff;
-  --edge:#c2d0d8; --edge2:#a8bcc7;
-  --txt:#0e1a22; --dim:#5a6b78; --dim2:#8497a3;
-  --green:#0a8f45; --greenbg:#d3f0dd; --cyan:#0891b2;
-  --red:#d4342f; --redbg:#f7dada; --amber:#b5790a; --amberbg:#f6ecd2;
-  --warn:#b5790a;
-  --btn:#e6edf1; --btn-h:#d7e2e8; --btn-edge:#bccdd6;
+  --bg:#eaeef1; --bg2:#f3f6f8;
+  --surf-1:#ffffff; --surf-2:#f7fafc; --surf-3:#eef3f7; --surf-4:#e1eaf1;
+  --panel:var(--surf-1); --panel2:#f4f8fa;
+  --line:#d5dfe6; --line-2:#bfced8; --line-3:#a4b8c5;
+  --edge:var(--line); --edge2:var(--line-2);
+  --txt:#0d1a23; --dim:#5a6e7c; --dim2:#8ba0ad;
+  --green:#0a8f45; --greenbg:#d8f2e2; --green-gl:rgba(10,143,69,.22);
+  --cyan:#0284a8;  --cyanbg:#d5eff6;  --cyan-gl:rgba(2,132,168,.22);
+  --amber:#a86c05; --amberbg:#f8ecd0; --amber-gl:rgba(168,108,5,.22);
+  --red:#cc2d3a;   --redbg:#fadcdf;   --red-gl:rgba(204,45,58,.22);
+  --violet:#6d4ed8; --violet-gl:rgba(109,78,216,.22);
+  --warn:var(--amber);
+  --btn:var(--surf-3); --btn-h:var(--surf-4); --btn-edge:var(--line-2);
+  --focus:var(--cyan);
+  --e1:0 1px 2px rgba(16,38,55,.10);
+  --e2:0 3px 10px -2px rgba(16,38,55,.16), 0 1px 2px rgba(16,38,55,.08);
+  --e3:0 20px 56px -12px rgba(16,38,55,.30);
+  --sheen:inset 0 1px 0 rgba(255,255,255,.9);
+  --bezel:inset 0 0 0 1px rgba(255,255,255,.6), inset 0 2px 6px rgba(16,38,55,.10);
+  --glass:rgba(255,255,255,.86);
+  --scan:rgba(10,30,45,.010);
+  --grid-ink:rgba(20,70,100,.035);
+}
+
+/* ---------- type + metric scale ---------- */
+:root {
+  /* Three faces, three jobs. All self-hosted from /static/fonts (see
+     fonts/selfhost_fonts.py) - the field laptop has no internet, and a
+     missing webfont would resize every element in a --u-scaled layout.
+       --display  Chakra Petch. Angular, technical, aerospace-adjacent.
+                  Brand, panel titles, instrument chips, HUD readouts.
+       --ui       Saira. A technical grotesque - narrower than Inter, so
+                  more label fits per column, and it does not read as a
+                  generic web dashboard.
+       --mono     JetBrains Mono. Console and any figure worth aligning. */
+  --display:"Chakra Petch","Saira",-apple-system,system-ui,sans-serif;
+  --ui:"Saira",-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,Roboto,sans-serif;
+  --mono:"JetBrains Mono","SF Mono",ui-monospace,Menlo,Consolas,monospace;
+
+  --fs-micro:calc(8.5 * var(--u));
+  --fs-xs:calc(9.5 * var(--u));
+  --fs-sm:calc(11 * var(--u));
+  --fs-md:calc(12 * var(--u));
+  --fs-lg:calc(13.5 * var(--u));
+  --fs-hud:calc(23 * var(--u));
+
+  --sp-1:calc(3 * var(--u));
+  --sp-2:calc(5 * var(--u));
+  --sp-3:calc(7 * var(--u));
+  --sp-4:calc(10 * var(--u));
+  --sp-5:calc(14 * var(--u));
+
+  --ctl-h:calc(23 * var(--u));
+  --hdr-h:calc(36 * var(--u));
+  --hud-h:calc(46 * var(--u));
+  --col-side:calc(198 * var(--u));
+  --col-radar:calc(232 * var(--u));
+  --row-bottom:calc(228 * var(--u));
+  --cam-w:calc(228 * var(--u));
+
+  --r-sm:calc(4 * var(--u));
+  --r-md:calc(7 * var(--u));
+  --r-lg:calc(11 * var(--u));
+  --micro:var(--fs-micro);
 }
 
 * { box-sizing:border-box; }
 html,body { height:100%; margin:0; }
 body {
-  background:var(--bg); color:var(--txt);
-  font-family:"SF Mono",ui-monospace,Menlo,Consolas,monospace;
-  font-size:12px; overflow:hidden;
+  min-width:0;
+  background:radial-gradient(140% 100% at 50% -15%, var(--bg2), var(--bg) 55%);
+  color:var(--txt);
+  font-family:var(--ui);
+  font-size:var(--fs-sm); line-height:1.35;
+  overflow:auto;
+  -webkit-font-smoothing:antialiased;
+  text-rendering:optimizeLegibility;
 }
+/* HUD field: scanlines + engineering grid + vignette. Decorative only, and it
+   sits BELOW the toast (4000) and the confirm modal (5000) on purpose. */
+body::before {
+  content:""; position:fixed; inset:0; z-index:2500; pointer-events:none;
+  background:
+    repeating-linear-gradient(0deg, var(--scan) 0 1px, transparent 1px 3px),
+    linear-gradient(var(--grid-ink) 1px, transparent 1px) 0 0/100% 44px,
+    linear-gradient(90deg, var(--grid-ink) 1px, transparent 1px) 0 0/44px 100%,
+    radial-gradient(135% 105% at 50% 38%, transparent 52%, rgba(0,0,0,.34));
+}
+body[data-theme="light"]::before { opacity:.55; }
 b { color:var(--txt); font-weight:600; }
+::selection { background:var(--cyan-gl); }
 
-/* ---------- header ---------- */
+/* Numbers are mono + tabular wherever they appear. One rule, so a new readout
+   only has to land in the right element to be typeset correctly. */
+.kv td:last-child, .chip b, .dlv-grid b, .srv-readout, .srv-marks,
+.spark .val, .radar-zoom #rz-lvl, .map-coords, .dlv-row-dist,
+.cam-servo .srv-btn, .cam-top, .dlv-book td, .hud-cell b, .chip-time,
+.mode-status b, .radar-status b {
+  font-family:var(--mono); font-variant-numeric:tabular-nums;
+  font-feature-settings:"tnum" 1;
+}
+/* the unit half of a readout, emitted by kvVal() in app.js */
+.u { color:var(--dim2); font-size:.82em; font-weight:400; margin-left:.25em;
+     letter-spacing:0; }
+
+/* icons */
+.ico-defs { display:none; }
+.ico { width:calc(12 * var(--u)); height:calc(12 * var(--u));
+       flex:0 0 auto; fill:none; stroke:currentColor; stroke-width:1.7;
+       stroke-linecap:round; stroke-linejoin:round; opacity:.9; }
+
+/* =========================== header =========================== */
 #hdr {
-  height:34px; display:flex; align-items:center; gap:14px;
-  padding:0 12px; background:var(--bg2); border-bottom:1px solid var(--edge);
+  height:var(--hdr-h); min-width:0;
+  display:flex; align-items:center; gap:var(--sp-5);
+  padding:0 var(--sp-4); position:relative; z-index:10;
+  background:linear-gradient(180deg, var(--surf-2), var(--bg2));
+  border-bottom:1px solid var(--line);
+  box-shadow:var(--e1), var(--sheen);
 }
-#hdr .title { color:var(--green); font-weight:700; letter-spacing:1px; font-size:13px; }
-.pills { display:flex; gap:6px; }
-.pill {
-  padding:2px 9px; border-radius:3px; font-size:11px; font-weight:600;
-  background:var(--btn); border:1px solid var(--btn-edge); color:var(--dim);
+#hdr::after {
+  content:""; position:absolute; left:0; right:0; bottom:-1px; height:1px;
+  background:linear-gradient(90deg, var(--cyan), transparent 34%);
+  opacity:.5;
 }
-.pill.good { color:var(--green); border-color:var(--green); background:var(--greenbg); }
-.pill.bad  { color:var(--red);   border-color:var(--red);   background:var(--redbg); }
-.pill.warn { color:var(--amber); border-color:var(--amber); background:var(--amberbg); }
-.chips { margin-left:auto; display:flex; align-items:center; gap:12px; color:var(--dim); }
-.chip { white-space:nowrap; }
-.chip b { color:var(--txt); }
+#hdr .title { display:flex; align-items:baseline; gap:calc(6 * var(--u));
+              white-space:nowrap; }
+.brand-mark {
+  width:calc(15 * var(--u)); height:calc(15 * var(--u));
+  align-self:center; fill:none; stroke:var(--cyan); stroke-width:1.8;
+  stroke-linejoin:round;
+  filter:drop-shadow(0 0 6px var(--cyan-gl));
+}
+.brand-name { color:var(--txt); font-family:var(--display); font-weight:700;
+              font-size:var(--fs-lg);
+              letter-spacing:.2em; }
+.brand-sub  { color:var(--dim2); font-family:var(--display); font-weight:500;
+              font-size:var(--fs-micro);
+              letter-spacing:.22em; text-transform:uppercase; }
+
+.pills { display:flex; gap:var(--sp-2); align-items:center; }
+/* `.pill` is ALSO the delivery order-book pill further down at a much smaller
+   scale. Header pills are scoped so the two never fight - before v2 the later,
+   smaller rule silently won here. */
+.pills .pill {
+  padding:calc(2 * var(--u)) calc(9 * var(--u));
+  border-radius:999px;
+  font-size:var(--fs-micro); font-weight:700; letter-spacing:.1em;
+  text-transform:uppercase;
+  background:var(--surf-3); border:1px solid var(--line-2); color:var(--dim);
+  box-shadow:var(--e1);
+  transition:color .18s, border-color .18s, background .18s, box-shadow .18s;
+}
+.pills .pill.good { color:var(--green); border-color:var(--green); background:var(--greenbg);
+                    box-shadow:0 0 0 1px var(--green-gl), 0 0 14px -3px var(--green-gl); }
+.pills .pill.bad  { color:var(--red);   border-color:var(--red);   background:var(--redbg);
+                    box-shadow:0 0 0 1px var(--red-gl), 0 0 14px -3px var(--red-gl); }
+.pills .pill.warn { color:var(--amber); border-color:var(--amber); background:var(--amberbg);
+                    box-shadow:0 0 0 1px var(--amber-gl), 0 0 14px -3px var(--amber-gl); }
+.pill { border-radius:var(--r-sm); font-weight:700; }
+
+.chips { margin-left:auto; display:flex; align-items:center; gap:var(--sp-4);
+         color:var(--dim); }
+/* each chip is a miniature instrument: engraved key, tabular value */
+.chip { display:inline-flex; align-items:baseline; gap:calc(4 * var(--u));
+        white-space:nowrap; }
+.chip-k { font-family:var(--display); font-size:var(--fs-micro);
+          letter-spacing:.14em; text-transform:uppercase;
+          color:var(--dim2); }
+.chip b { color:var(--txt); font-size:var(--fs-sm); font-weight:600; }
+.chip-u { color:var(--dim2); font-size:var(--fs-micro); }
+.chip-time { color:var(--dim); font-size:var(--fs-xs); letter-spacing:.04em; }
+.hdr-sep { width:1px; height:calc(16 * var(--u)); background:var(--line-2);
+           margin:0 calc(2 * var(--u)); }
 .theme-btn {
-  background:var(--btn); border:1px solid var(--btn-edge); color:var(--amber);
-  border-radius:4px; width:26px; height:22px; cursor:pointer; font-size:13px;
+  background:var(--surf-3); border:1px solid var(--line-2); color:var(--amber);
+  border-radius:var(--r-sm);
+  width:calc(24 * var(--u)); height:calc(21 * var(--u));
+  cursor:pointer; font-size:var(--fs-sm);
+  display:inline-flex; align-items:center; justify-content:center;
+  box-shadow:var(--e1); transition:background .15s, border-color .15s, color .15s;
 }
-.theme-btn:hover { background:var(--btn-h); }
+.theme-btn:hover { background:var(--btn-h); border-color:var(--line-3); }
+#density-toggle { color:var(--cyan); }
 
-/* ---------- app grid ---------- */
+/* =========================== app shell =========================== */
+/* The shell has a hard floor: minmax() keeps the map band from collapsing on a
+   short window, and min-width/min-height make the page scroll past that floor
+   instead of crushing every panel. A station that silently shrinks its map is
+   worse than one that asks for room. */
 .app {
-  height:calc(100vh - 34px); padding:6px; gap:6px;
+  height:calc(100vh - var(--hdr-h));
+  min-height:calc(470 * var(--u)); min-width:0;
+  padding:var(--sp-3); gap:var(--sp-3);
   display:grid;
-  grid-template-columns:186px 224px 1fr;
-  grid-template-rows:1fr 224px;
+  grid-template-columns:var(--col-side) var(--col-radar) minmax(0,1fr);
+  grid-template-rows:var(--hud-h) minmax(calc(250 * var(--u)),1fr) var(--row-bottom);
 }
-.sidebar   { grid-column:1; grid-row:1; overflow-y:auto; }
-.col-radar { grid-column:2; grid-row:1; display:flex; flex-direction:column; gap:6px; min-height:0; }
-.map-panel { grid-column:3; grid-row:1; position:relative; padding:0; overflow:hidden; }
-.bottom    { grid-column:1 / -1; grid-row:2;
-             display:grid; grid-template-columns:repeat(6,1fr); gap:6px; min-height:0; }
+.sidebar   { grid-column:1; grid-row:2; overflow-y:auto; overflow-x:hidden;
+             display:flex; flex-direction:column; gap:var(--sp-3);
+             padding-right:calc(2 * var(--u)); }
+.col-radar { grid-column:2; grid-row:2; display:flex; flex-direction:column;
+             gap:var(--sp-3); min-height:0; }
+.map-panel { grid-column:3; grid-row:2; position:relative; padding:0;
+             overflow:hidden; min-width:0; }
+.bottom    { grid-column:1 / -1; grid-row:3;
+             display:grid; grid-template-columns:repeat(6,minmax(0,1fr));
+             gap:var(--sp-3); min-height:0; }
 
-/* ---------- panels ---------- */
+/* =========================== primary flight band =========================== */
+.hudbar {
+  grid-column:1 / -1; grid-row:1;
+  display:flex; align-items:stretch; gap:0;
+  padding:0 var(--sp-3);
+  border:1px solid var(--line); border-radius:var(--r-md);
+  background:
+    linear-gradient(180deg, var(--surf-2), var(--surf-1));
+  box-shadow:var(--e2), var(--sheen);
+  overflow:hidden;
+}
+.hud-state {
+  align-self:center; flex:0 0 auto;
+  font-size:var(--fs-micro); font-weight:800; letter-spacing:.16em;
+  text-transform:uppercase;
+  padding:calc(4 * var(--u)) calc(10 * var(--u));
+  border-radius:999px; border:1px solid var(--line-2);
+  background:var(--surf-3); color:var(--dim);
+  margin-right:var(--sp-4);
+  transition:color .25s, border-color .25s, background .25s, box-shadow .25s;
+}
+.hud-state.ready { color:var(--cyan); border-color:var(--cyan); background:var(--cyanbg);
+                   box-shadow:0 0 0 1px var(--cyan-gl); }
+.hud-state.armed { color:var(--green); border-color:var(--green); background:var(--greenbg);
+                   box-shadow:0 0 0 1px var(--green-gl), 0 0 20px -4px var(--green-gl);
+                   animation:hud-live 2.4s ease-in-out infinite; }
+.hud-state.down  { color:var(--red); border-color:var(--red); background:var(--redbg);
+                   box-shadow:0 0 0 1px var(--red-gl); }
+@keyframes hud-live { 50% { box-shadow:0 0 0 1px var(--green-gl), 0 0 30px -2px var(--green-gl); } }
+
+.hud-cell {
+  flex:1 1 0; min-width:0;
+  display:flex; flex-direction:column; justify-content:center;
+  padding:0 var(--sp-4);
+  border-left:1px solid var(--line);
+  position:relative;
+}
+.hud-cell:first-of-type { border-left:0; }
+.hud-k { font-family:var(--display); font-size:var(--fs-micro);
+         letter-spacing:.16em; text-transform:uppercase;
+         color:var(--dim2); line-height:1; margin-bottom:calc(3 * var(--u)); }
+.hud-cell b {
+  font-size:var(--fs-hud); font-weight:600; line-height:1;
+  letter-spacing:-.01em; color:var(--txt);
+  transition:color .25s;
+}
+.hud-u { position:absolute; right:var(--sp-3); bottom:calc(6 * var(--u));
+         font-size:var(--fs-micro); color:var(--dim2); letter-spacing:.06em; }
+.hud-cell.good b { color:var(--green); }
+.hud-cell.warn b { color:var(--amber); }
+.hud-cell.bad  b { color:var(--red); text-shadow:0 0 16px var(--red-gl); }
+
+/* A real compass card: fixed N, needle driven by heading in updateHud(). */
+.hud-compass {
+  flex:0 0 auto; align-self:center; position:relative;
+  width:calc(30 * var(--u)); height:calc(30 * var(--u));
+  margin-left:var(--sp-4); border-radius:50%;
+  border:1px solid var(--line-2); background:var(--panel2);
+  box-shadow:var(--bezel);
+}
+.hud-n { position:absolute; top:calc(1 * var(--u)); left:50%;
+         transform:translateX(-50%);
+         font-size:calc(6 * var(--u)); color:var(--dim2); letter-spacing:.05em; }
+.hud-ring { position:absolute; inset:0; transition:transform .3s ease-out; }
+.hud-ring::before {
+  content:""; position:absolute; left:50%; top:14%;
+  width:calc(1.6 * var(--u)); height:38%;
+  transform:translateX(-50%); border-radius:1px;
+  background:var(--cyan); box-shadow:0 0 6px var(--cyan-gl);
+}
+.hud-ring::after {
+  content:""; position:absolute; left:50%; top:50%;
+  width:calc(3 * var(--u)); height:calc(3 * var(--u));
+  transform:translate(-50%,-50%); border-radius:50%; background:var(--dim2);
+}
+
+/* =========================== panels =========================== */
 .panel {
-  background:var(--panel); border:1px solid var(--edge); border-radius:6px;
-  padding:8px; display:flex; flex-direction:column; min-height:0; overflow:hidden;
+  position:relative;
+  background:linear-gradient(180deg, var(--surf-2), var(--surf-1) 46%);
+  border:1px solid var(--line);
+  border-radius:var(--r-md);
+  padding:var(--sp-3) var(--sp-3);
+  display:flex; flex-direction:column; min-height:0;
+  overflow:hidden; overflow-y:auto;
+  box-shadow:var(--e2), var(--sheen);
+  transition:border-color .18s, box-shadow .18s;
 }
+/* per-domain accent: one hairline of colour at the top edge and on the title
+   tick. Colour identifies the panel, it never decorates it. */
+.panel { --accent:var(--cyan); }
+.panel[data-accent="telem"]    { --accent:var(--cyan); }
+.panel[data-accent="avoid"]    { --accent:var(--amber); }
+.panel[data-accent="mission"]  { --accent:var(--violet); }
+.panel[data-accent="delivery"] { --accent:var(--green); }
+.panel[data-accent="health"]   { --accent:#5b9dff; }
+.panel[data-accent="console"]  { --accent:var(--dim); }
+.bottom .panel::after {
+  content:""; position:absolute; top:0; left:0; right:0;
+  height:1px; background:var(--accent); opacity:.55;
+}
+.bottom .panel:hover { border-color:var(--line-2);
+                       box-shadow:var(--e2), var(--sheen), 0 0 0 1px rgba(255,255,255,.02); }
 .panel-hd {
-  display:flex; align-items:center; gap:6px; justify-content:space-between;
-  color:var(--green); font-size:11px; font-weight:600; letter-spacing:.5px;
-  margin-bottom:6px; text-transform:uppercase;
+  display:flex; align-items:center; gap:var(--sp-2); justify-content:space-between;
+  color:var(--dim); font-size:var(--fs-micro); font-weight:700;
+  letter-spacing:.15em; text-transform:uppercase;
+  margin:0 0 var(--sp-3); padding:0 0 var(--sp-2) calc(9 * var(--u));
+  border-bottom:1px solid var(--line);
+  position:sticky; top:calc(-1 * var(--sp-3)); background:var(--surf-2); z-index:2;
 }
+/* Accent tick. Absolutely positioned, NOT a flex child: .panel-hd is
+   space-between, so a ::before flex item shoves single-title headers right. */
+.panel-hd::before {
+  content:""; position:absolute; left:0; top:50%;
+  transform:translateY(-50%); margin-top:calc(-1 * var(--sp-1));
+  width:calc(2 * var(--u)); height:calc(11 * var(--u)); border-radius:1px;
+  background:var(--accent); box-shadow:0 0 8px var(--accent);
+}
+.hd-title { display:inline-flex; align-items:center; gap:var(--sp-2);
+           font-family:var(--display); font-weight:600;
+            color:var(--txt); }
+.hd-title .ico { color:var(--accent); }
 
-/* ---------- sidebar ---------- */
-.sidebar { display:flex; flex-direction:column; gap:10px; }
-.sect h3 { margin:0 0 5px; font-size:10px; color:var(--dim); letter-spacing:1px; font-weight:600; }
-.btn-col { display:flex; flex-direction:column; gap:5px; }
-.btn-row { display:flex; gap:5px; }
-.btn-row > * { flex:1; }
-button, .select {
-  background:var(--btn); color:var(--txt); border:1px solid var(--btn-edge);
-  border-radius:4px; padding:6px 8px; font:inherit; font-size:11px; cursor:pointer;
-  text-align:center; transition:background .12s,border-color .12s;
+/* =========================== sidebar =========================== */
+/* Each section is a card, not a loose stack - grouping is what makes a dense
+   control column readable. */
+.sect {
+  background:linear-gradient(180deg, var(--surf-2), var(--surf-1) 50%);
+  border:1px solid var(--line); border-radius:var(--r-md);
+  padding:var(--sp-3); box-shadow:var(--e1), var(--sheen);
 }
-button:hover { background:var(--btn-h); }
-button:active { transform:translateY(1px); }
+.sect h3 {
+  margin:0 0 var(--sp-3); font-size:var(--fs-micro); color:var(--dim);
+  letter-spacing:.15em; font-weight:700; text-transform:uppercase;
+  display:flex; align-items:center; gap:var(--sp-2);
+}
+.sect h3::after {
+  content:""; flex:1; height:1px;
+  background:linear-gradient(90deg, var(--line-2), transparent);
+}
+.btn-col { display:flex; flex-direction:column; gap:var(--sp-1); }
+.btn-row { display:flex; gap:var(--sp-1); }
+.btn-row > * { flex:1; min-width:0; }
+
+/* =========================== controls =========================== */
+button, .select {
+  background:linear-gradient(180deg, var(--surf-3), var(--surf-2));
+  color:var(--txt);
+  border:1px solid var(--btn-edge);
+  border-radius:var(--r-sm);
+  padding:0 calc(9 * var(--u)); min-height:var(--ctl-h);
+  font-family:var(--ui); font-size:var(--fs-xs); font-weight:600;
+  letter-spacing:.05em;
+  cursor:pointer; text-align:center;
+  display:inline-flex; align-items:center; justify-content:center;
+  gap:calc(5 * var(--u));
+  box-shadow:var(--e1), var(--sheen);
+  transition:background .14s, border-color .14s, color .14s,
+             box-shadow .14s, transform .08s;
+}
+button:hover { background:linear-gradient(180deg, var(--btn-h), var(--surf-3));
+               border-color:var(--line-3); }
+button:active { transform:translateY(1px); box-shadow:none; }
+button:focus-visible, .select:focus-visible, input:focus-visible {
+  outline:none; border-color:var(--focus);
+  box-shadow:0 0 0 2px var(--cyan-gl), 0 0 14px -2px var(--cyan-gl);
+}
+button:disabled { opacity:.32; cursor:not-allowed; box-shadow:none; }
 button.wide { width:100%; }
-button.ok     { color:var(--green); border-color:var(--green); }
-button.ok:hover{ background:var(--greenbg); }
-button.danger { color:var(--red); border-color:var(--red); }
-button.danger:hover{ background:var(--redbg); }
-button.amber  { color:var(--amber); border-color:var(--amber); }
-button.amber:hover{ background:var(--amberbg); }
-button.tog.on { background:var(--greenbg); color:var(--green); border-color:var(--green); }
-button.tog.danger.on { background:var(--redbg); color:var(--red); border-color:var(--red); }
+button.ok      { color:var(--green); border-color:color-mix(in srgb, var(--green) 50%, var(--line-2)); }
+button.ok:hover{ background:var(--greenbg); border-color:var(--green);
+                 box-shadow:0 0 12px -3px var(--green-gl); }
+button.danger  { color:var(--red); border-color:color-mix(in srgb, var(--red) 50%, var(--line-2)); }
+button.danger:hover{ background:var(--redbg); border-color:var(--red);
+                 box-shadow:0 0 12px -3px var(--red-gl); }
+button.amber   { color:var(--amber); border-color:color-mix(in srgb, var(--amber) 50%, var(--line-2)); }
+button.amber:hover{ background:var(--amberbg); border-color:var(--amber);
+                 box-shadow:0 0 12px -3px var(--amber-gl); }
+/* an engaged toggle is FILLED, not merely tinted - state must be unmistakable */
+button.tog.on {
+  background:linear-gradient(180deg, var(--greenbg), color-mix(in srgb, var(--greenbg) 60%, #000));
+  color:var(--green); border-color:var(--green);
+  box-shadow:0 0 0 1px var(--green-gl), 0 0 16px -4px var(--green-gl), var(--sheen);
+}
+button.tog.danger.on {
+  background:linear-gradient(180deg, var(--redbg), color-mix(in srgb, var(--redbg) 60%, #000));
+  color:var(--red); border-color:var(--red);
+  box-shadow:0 0 0 1px var(--red-gl), 0 0 16px -4px var(--red-gl), var(--sheen);
+}
 .select { width:100%; }
 
-/* ---------- radar ---------- */
+/* =========================== radar =========================== */
 .radar-panel { flex:0 0 auto; }
-.radar-status { font-size:10px; color:var(--dim); }
-.radar-status b { color:var(--amber); }
-.radar-zoom { display:flex; gap:3px; align-items:center; }
-.radar-zoom button { padding:0; width:18px; height:18px; font-size:12px; line-height:1; }
-.radar-zoom #rz-lvl { color:var(--cyan); font-size:10px; min-width:26px; text-align:center; }
-.radar-wrap { position:relative; display:flex; justify-content:center; align-items:center; }
-#radar { width:100%; height:auto; max-width:210px; aspect-ratio:1; cursor:crosshair; touch-action:none; }
+.radar-status { font-size:var(--fs-micro); color:var(--dim); letter-spacing:.08em;
+                text-transform:uppercase; }
+.radar-status b { color:var(--amber); letter-spacing:0; text-transform:none; }
+.radar-zoom { display:flex; gap:calc(3 * var(--u)); align-items:center; }
+.radar-zoom button { padding:0; width:calc(18 * var(--u)); height:calc(18 * var(--u));
+                     min-height:calc(18 * var(--u)); font-size:var(--fs-sm); line-height:1; }
+.radar-zoom #rz-lvl { color:var(--cyan); font-size:var(--fs-micro);
+                      min-width:calc(28 * var(--u)); text-align:center; font-weight:600; }
+/* bezelled instrument well - the radar reads as hardware set into the panel */
+.radar-wrap {
+  position:relative; display:flex; justify-content:center; align-items:center;
+  margin-top:var(--sp-2); padding:var(--sp-2);
+  border-radius:var(--r-md); background:var(--panel2);
+  box-shadow:var(--bezel);
+}
+.radar-wrap::before, .radar-wrap::after {
+  content:""; position:absolute; width:calc(13 * var(--u)); height:calc(13 * var(--u));
+  pointer-events:none; border:1px solid var(--line-3); opacity:.9;
+}
+.radar-wrap::before { top:calc(3 * var(--u)); left:calc(3 * var(--u));
+                      border-right:0; border-bottom:0; }
+.radar-wrap::after  { bottom:calc(3 * var(--u)); right:calc(3 * var(--u));
+                      border-left:0; border-top:0; }
+/* NOTE: deliberately no animated sweep over the canvas. This is the live
+   obstacle picture for real hardware - nothing decorative goes on top of it. */
+#radar { width:100%; height:auto; max-width:calc(212 * var(--u)); aspect-ratio:1;
+         cursor:crosshair; touch-action:none;
+         filter:drop-shadow(0 0 10px rgba(0,0,0,.6)); }
 .brake-overlay {
-  position:absolute; top:38%; left:50%; transform:translateX(-50%);
-  color:var(--red); font-weight:700; font-size:13px; text-align:center;
-  text-shadow:0 0 6px #000; display:none; pointer-events:none;
+  position:absolute; top:36%; left:50%; transform:translateX(-50%);
+  color:var(--red); font-weight:800; font-size:var(--fs-md); text-align:center;
+  letter-spacing:.16em; text-transform:uppercase;
+  padding:calc(3 * var(--u)) calc(10 * var(--u)); border-radius:var(--r-sm);
+  background:rgba(10,3,5,.78); border:1px solid var(--red);
+  text-shadow:0 0 8px var(--red-gl);
+  box-shadow:0 0 26px -4px var(--red-gl);
+  display:none; pointer-events:none;
 }
 .brake-overlay.show { display:block; animation:blink .6s steps(2) infinite; }
 @keyframes blink { 50% { opacity:.25; } }
 body.radar-expanded .radar-panel {
-  position:fixed; inset:5% 5% 5% 5%; z-index:2000; max-width:none;
+  position:fixed; inset:5% 5% 5% 5%; z-index:2600; max-width:none;
+  box-shadow:var(--e3);
 }
 body.radar-expanded #radar { max-width:min(80vh,80vw); }
 
-/* ---------- flight modes ---------- */
+/* =========================== flight modes =========================== */
 .modes-panel { flex:1 1 auto; }
-.mode-status { font-size:10px; color:var(--dim); margin-bottom:6px; }
-.mode-status b { color:var(--txt); }
-.mode-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:4px; overflow-y:auto; }
-.mode-grid button { padding:6px 2px; font-size:10px; }
-.mode-grid button.on { background:var(--greenbg); color:var(--green); border-color:var(--green); }
+.mode-status { font-size:var(--fs-micro); color:var(--dim); margin-bottom:var(--sp-2);
+               letter-spacing:.1em; text-transform:uppercase; }
+.mode-status b { color:var(--txt); letter-spacing:0; text-transform:none;
+                 font-size:var(--fs-xs); }
+.mode-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:calc(4 * var(--u));
+             overflow-y:auto; padding-right:calc(2 * var(--u)); }
+.mode-grid button { padding:calc(2 * var(--u)) calc(1 * var(--u));
+                    min-height:calc(25 * var(--u)); font-size:var(--fs-micro);
+                    letter-spacing:.03em; line-height:1.15; }
+.mode-grid button.on {
+  background:linear-gradient(180deg, var(--greenbg), color-mix(in srgb, var(--greenbg) 60%, #000));
+  color:var(--green); border-color:var(--green);
+  box-shadow:0 0 0 1px var(--green-gl), 0 0 16px -5px var(--green-gl);
+}
 
-/* ---------- map ---------- */
+/* =========================== map =========================== */
 #map { position:absolute; inset:0; background:var(--bg); }
 .map-toolbar {
-  position:absolute; top:8px; left:8px; z-index:600; display:flex; gap:5px; flex-wrap:wrap;
-  background:rgba(7,11,14,.72); padding:5px; border-radius:6px; border:1px solid var(--edge);
+  position:absolute; top:var(--sp-3); left:var(--sp-3); z-index:600;
+  display:flex; gap:calc(4 * var(--u)); flex-wrap:wrap; align-items:center;
+  background:var(--glass); padding:calc(5 * var(--u)); border-radius:var(--r-md);
+  border:1px solid var(--line-2);
+  box-shadow:var(--e2), var(--sheen);
+  -webkit-backdrop-filter:blur(14px) saturate(140%);
+          backdrop-filter:blur(14px) saturate(140%);
 }
-.map-toolbar button { padding:4px 9px; font-size:11px; }
-.map-toolbar .layers { display:flex; gap:4px; }
-.map-toolbar .lyr.on { background:var(--greenbg); color:var(--green); border-color:var(--green); }
-.map-toolbar #tb-wp.on { background:var(--cyan); color:#00252b; border-color:var(--cyan); }
+.map-toolbar button { padding:0 calc(8 * var(--u));
+                      min-height:calc(21 * var(--u)); font-size:var(--fs-micro); }
+/* the four base layers are one control, so they read as one segmented block */
+.map-toolbar .layers { display:flex; gap:0; border:1px solid var(--line-2);
+                       border-radius:var(--r-sm); overflow:hidden; }
+.map-toolbar .layers button { border:0; border-radius:0; box-shadow:none;
+                              border-right:1px solid var(--line-2); }
+.map-toolbar .layers button:last-child { border-right:0; }
+.map-toolbar .lyr.on {
+  background:var(--cyanbg); color:var(--cyan);
+  box-shadow:inset 0 0 0 1px var(--cyan-gl);
+}
+.map-toolbar #tb-wp.on {
+  background:var(--cyan); color:#02222a; border-color:var(--cyan); font-weight:700;
+  box-shadow:0 0 16px -3px var(--cyan-gl);
+}
 .map-coords {
-  position:absolute; bottom:8px; left:8px; z-index:600; font-size:11px;
-  background:rgba(7,11,14,.72); padding:5px 8px; border-radius:6px; border:1px solid var(--edge);
+  position:absolute; bottom:var(--sp-3); left:var(--sp-3); z-index:600;
+  font-size:var(--fs-micro);
+  background:var(--glass); padding:calc(5 * var(--u)) calc(8 * var(--u));
+  border-radius:var(--r-md); border:1px solid var(--line-2);
+  box-shadow:var(--e2), var(--sheen);
+  -webkit-backdrop-filter:blur(14px) saturate(140%);
+          backdrop-filter:blur(14px) saturate(140%);
+  letter-spacing:.02em; line-height:1.6;
 }
-.map-coords .green { color:var(--green); } .map-coords .cyan { color:var(--cyan); }
-.drone-icon { color:var(--amber); font-size:18px; text-shadow:0 0 4px #000; }
-.wp-icon { width:10px; height:10px; background:var(--cyan); border:2px solid #06232a; border-radius:50%; }
+.map-coords .green { color:var(--green); }
+.map-coords .cyan  { color:var(--cyan); }
+.drone-icon { color:var(--amber); font-size:calc(18 * var(--u));
+              text-shadow:0 0 8px rgba(0,0,0,.9); }
+/* app.js writes an inline transform:rotate() onto this span. An inline element
+   ignores transform entirely - it has to be a block for heading to show. */
+.drone-rot { display:block; transform-origin:50% 50%; line-height:1;
+             transition:transform .25s linear; will-change:transform; }
+.wp-icon { width:calc(10 * var(--u)); height:calc(10 * var(--u));
+           background:var(--cyan); border:2px solid #04212a; border-radius:50%;
+           box-shadow:0 0 10px var(--cyan-gl); }
 
-/* ---------- camera tiles (overlaid on map) ---------- */
-.cams { position:absolute; right:8px; bottom:8px; z-index:600; display:flex; gap:6px; }
-.cam {
-  position:relative; width:232px; height:130px; background:#04070a;
-  border:1px solid var(--edge2); border-radius:5px; overflow:hidden;
+/* =========================== camera tiles (overlaid on map) =========================== */
+/* Camera overlay. Stacks downward so the AUX6 servo buttons sit directly
+   above the (now single) camera tile and move with it. */
+.cams {
+  position:absolute; right:var(--sp-3); bottom:var(--sp-3); z-index:600;
+  display:flex; flex-direction:column; align-items:flex-end; gap:var(--sp-2);
 }
-.cam-img { width:100%; height:100%; object-fit:cover; display:block; background:#04070a; }
-.cam-ov { position:absolute; inset:0; pointer-events:none; }
-.cam-box { position:absolute; border:1.5px solid var(--green); box-shadow:0 0 4px rgba(56,224,123,.6); }
+.cam {
+  position:relative; width:var(--cam-w); height:calc(var(--cam-w) * 0.5614);
+  background:#000; border:1px solid var(--line-2); border-radius:var(--r-md);
+  overflow:hidden; box-shadow:var(--e3), var(--sheen);
+}
+/* viewfinder corner brackets */
+.cam::after {
+  content:""; position:absolute; inset:calc(5 * var(--u)); pointer-events:none; z-index:3;
+  border:1px solid rgba(150,220,255,.20);
+  clip-path:polygon(0 0,14px 0,14px 1px,1px 1px,1px 14px,0 14px,
+                    0 100%,14px 100%,14px calc(100% - 1px),1px calc(100% - 1px),1px calc(100% - 14px),0 calc(100% - 14px),
+                    100% 0,calc(100% - 14px) 0,calc(100% - 14px) 1px,calc(100% - 1px) 1px,calc(100% - 1px) 14px,100% 14px,
+                    100% 100%,calc(100% - 14px) 100%,calc(100% - 14px) calc(100% - 1px),calc(100% - 1px) calc(100% - 1px),calc(100% - 1px) calc(100% - 14px),100% calc(100% - 14px));
+}
+.cam-img { width:100%; height:100%; object-fit:cover; display:block; background:#000; }
+.cam-ov { position:absolute; inset:0; pointer-events:none; z-index:2; }
+.cam-box { position:absolute; border:1.5px solid var(--green);
+           box-shadow:0 0 6px var(--green-gl), inset 0 0 6px rgba(61,220,132,.15);
+           border-radius:2px; }
 .cam-box span {
-  position:absolute; top:-14px; left:-1px; font-size:9px; color:#04120a;
-  background:var(--green); padding:0 3px; white-space:nowrap; border-radius:2px;
+  position:absolute; top:calc(-14 * var(--u)); left:-1px;
+  font-size:calc(9 * var(--u)); color:#02120a;
+  background:var(--green); padding:0 calc(4 * var(--u)); white-space:nowrap;
+  border-radius:2px; font-weight:700; letter-spacing:.04em;
 }
 .cam-top {
-  position:absolute; top:0; left:0; right:0; display:flex; justify-content:space-between;
-  padding:2px 5px; font-size:9px; color:#bfe9ff;
-  background:linear-gradient(rgba(0,0,0,.6),transparent);
+  position:absolute; top:0; left:0; right:0; z-index:3;
+  display:flex; justify-content:space-between;
+  padding:calc(4 * var(--u)) calc(7 * var(--u));
+  font-size:calc(9 * var(--u)); color:#cfe9ff; letter-spacing:.05em;
+  background:linear-gradient(rgba(0,0,0,.75),transparent);
 }
-.cam-gpu { color:var(--green); font-weight:700; }
+.cam-gpu { color:var(--green); font-weight:700; text-shadow:0 0 6px var(--green-gl); }
 
-/* ---------- live 3D drone widget - frosted HUD over the top-right of map ---- */
+/* =========================== live 3D drone widget =========================== */
 #prop3d-wrap {
-  position:absolute; top:8px; right:8px; width:150px; height:135px;
+  position:absolute; top:var(--sp-3); right:var(--sp-3);
+  width:calc(146 * var(--u)); height:calc(132 * var(--u));
   z-index:650; pointer-events:none;
 }
 /* Frosted glass: blurs ONLY the slice of map behind it. Feathered with a mask
  * so the edges fade out - reads as a HUD panel, never a hard black box. */
 #prop3d-glass {
   position:absolute; inset:0; border-radius:16px;
-  -webkit-backdrop-filter:blur(8px) saturate(118%);
-          backdrop-filter:blur(8px) saturate(118%);
+  -webkit-backdrop-filter:blur(9px) saturate(122%);
+          backdrop-filter:blur(9px) saturate(122%);
   background:radial-gradient(120% 95% at 50% 32%,
-              rgba(34,48,62,.16), rgba(8,13,18,.40));
-  border:1px solid rgba(120,205,255,.20);
-  box-shadow:0 6px 22px rgba(0,0,0,.35), inset 0 1px 0 rgba(255,255,255,.06);
+              rgba(40,60,78,.18), rgba(4,6,9,.46));
+  border:1px solid rgba(120,205,255,.22);
+  box-shadow:0 8px 26px rgba(0,0,0,.46), inset 0 1px 0 rgba(255,255,255,.07);
   -webkit-mask:radial-gradient(118% 100% at 50% 45%, #000 62%, transparent 100%);
           mask:radial-gradient(118% 100% at 50% 45%, #000 62%, transparent 100%);
 }
 #prop3d-label {
-  position:absolute; top:6px; left:12px; z-index:2;
-  font-size:9px; letter-spacing:1.5px; color:var(--cyan); opacity:.75;
-  text-shadow:0 0 6px #000;
+  position:absolute; top:calc(7 * var(--u)); left:calc(13 * var(--u)); z-index:2;
+  font-size:var(--fs-micro); letter-spacing:.2em; text-transform:uppercase;
+  color:var(--cyan); opacity:.8; font-weight:700; text-shadow:0 0 8px #000;
 }
 #prop3d-canvas-host, #prop3d-canvas-host canvas {
   position:absolute; inset:0; z-index:1;
   width:100%; height:100%; display:block; background:transparent;
 }
 
-/* ---------- key/value tables ---------- */
-.kv { width:100%; border-collapse:collapse; font-size:11px; }
-.kv td { padding:1.5px 0; }
-.kv td:first-child { color:var(--dim); }
-.kv td:last-child { text-align:right; color:var(--txt); font-weight:600; }
-.panel { overflow-y:auto; }
+/* =========================== key/value tables =========================== */
+.kv { width:100%; border-collapse:collapse; font-size:var(--fs-xs); }
+.kv td { padding:calc(2 * var(--u)) 0;
+         border-bottom:1px solid color-mix(in srgb, var(--line) 50%, transparent); }
+.kv tr:last-child td { border-bottom:0; }
+.kv td:first-child { color:var(--dim); font-size:var(--fs-micro);
+                     letter-spacing:.08em; text-transform:uppercase;
+                     white-space:nowrap; padding-right:var(--sp-2); }
+.kv td:last-child { text-align:right; color:var(--txt); font-weight:600;
+                    white-space:nowrap; }
 
-/* ---------- sparklines ---------- */
-.sparks { display:grid; grid-template-columns:1fr 1fr; gap:2px 10px; margin-top:6px; }
-.spark { display:flex; align-items:center; gap:5px; }
-.spark .lbl { color:var(--dim); font-size:9px; width:48px; }
-.spark canvas { flex:1; height:18px; }
-.spark .val { color:var(--cyan); font-size:10px; width:34px; text-align:right; }
+/* =========================== sparklines =========================== */
+.sparks { display:grid; grid-template-columns:1fr 1fr;
+          gap:calc(2 * var(--u)) var(--sp-4); margin-top:var(--sp-3); }
+.spark { display:flex; align-items:center; gap:var(--sp-2); }
+.spark .lbl { color:var(--dim); font-size:var(--fs-micro);
+              width:calc(46 * var(--u)); letter-spacing:.08em; text-transform:uppercase; }
+.spark canvas { flex:1; height:calc(18 * var(--u)); opacity:.95; }
+.spark .val { color:var(--cyan); font-size:var(--fs-micro);
+              width:calc(34 * var(--u)); text-align:right; font-weight:600; }
 
-/* ---------- console + NL ---------- */
-.console { flex:1; overflow-y:auto; font-size:10.5px; line-height:1.45; min-height:40px; }
+/* =========================== console + NL =========================== */
+.console {
+  flex:1; overflow-y:auto; min-height:calc(40 * var(--u));
+  font-family:var(--mono); font-size:var(--fs-micro); line-height:1.5;
+  padding:calc(2 * var(--u)) 0;
+}
 .console .t { color:var(--dim2); } .console .s { color:var(--cyan); }
 .console .INFO { color:var(--txt); } .console .WARNING { color:var(--amber); }
 .console .ERROR { color:var(--red); } .console .DEBUG { color:var(--dim); }
-.nl-bar { display:flex; gap:4px; margin-top:6px; }
+.nl-bar { display:flex; gap:calc(4 * var(--u)); margin-top:var(--sp-2); }
 .nl-bar input {
-  flex:1; background:var(--btn); border:1px solid var(--btn-edge); border-radius:4px;
-  color:var(--txt); font:inherit; font-size:11px; padding:6px 8px; min-width:0;
+  flex:1; background:var(--surf-3); border:1px solid var(--btn-edge);
+  border-radius:var(--r-sm);
+  color:var(--txt); font-family:var(--ui); font-size:var(--fs-xs);
+  padding:0 calc(8 * var(--u)); min-height:var(--ctl-h); min-width:0;
+  box-shadow:inset 0 1px 2px rgba(0,0,0,.3);
+  transition:border-color .14s, box-shadow .14s;
 }
-.nl-bar input:focus { outline:none; border-color:var(--green); }
+.nl-bar input::placeholder { color:var(--dim2); }
+.nl-bar input:focus {
+  outline:none; border-color:var(--focus);
+  box-shadow:0 0 0 2px var(--cyan-gl), inset 0 1px 2px rgba(0,0,0,.3);
+}
 .nl-bar button { flex:0 0 auto; }
-.nl-log { max-height:52px; overflow-y:auto; font-size:10px; margin-top:4px; }
+.nl-log { max-height:calc(52 * var(--u)); overflow-y:auto;
+          font-size:var(--fs-micro); margin-top:calc(4 * var(--u)); color:var(--dim); }
 .nl-log div { padding:1px 0; }
 
-/* ---------- safety confirm modal ---------- */
+/* =========================== safety confirm modal =========================== */
 .confirm-overlay {
   position:fixed; inset:0; z-index:5000; display:none;
-  background:rgba(0,0,0,.62); align-items:center; justify-content:center;
+  background:rgba(0,0,0,.72);
+  -webkit-backdrop-filter:blur(5px); backdrop-filter:blur(5px);
+  align-items:center; justify-content:center;
 }
-.confirm-overlay.show { display:flex; }
+.confirm-overlay.show { display:flex; animation:fade-in .16s ease-out; }
+@keyframes fade-in { from { opacity:0; } }
 .confirm-box {
-  width:340px; max-width:90vw; background:var(--panel); border:1px solid var(--red);
-  border-radius:10px; padding:22px 20px; text-align:center;
-  box-shadow:0 12px 40px rgba(0,0,0,.6);
+  width:calc(350 * var(--u)); max-width:90vw;
+  background:linear-gradient(180deg, var(--surf-2), var(--surf-1));
+  border:1px solid var(--red);
+  border-radius:var(--r-lg); padding:calc(22 * var(--u)) calc(20 * var(--u));
+  text-align:center;
+  box-shadow:var(--e3), 0 0 0 1px var(--red-gl), 0 0 70px -12px var(--red-gl), var(--sheen);
+  animation:confirm-in .18s cubic-bezier(.2,.9,.3,1);
 }
-.confirm-icon { font-size:34px; color:var(--amber); line-height:1; }
-.confirm-title { font-size:15px; font-weight:700; color:var(--txt); margin:10px 0 6px; letter-spacing:.5px; }
-.confirm-msg { font-size:12px; color:var(--dim); margin-bottom:18px; line-height:1.5; }
-.confirm-actions { display:flex; gap:10px; }
-.confirm-actions button { flex:1; padding:9px; font-size:12px; }
+@keyframes confirm-in { from { transform:translateY(10px) scale(.985); opacity:0; } }
+.confirm-icon { font-size:calc(32 * var(--u)); color:var(--amber); line-height:1;
+                filter:drop-shadow(0 0 12px var(--amber-gl)); }
+.confirm-title { font-size:var(--fs-lg); font-weight:700; color:var(--txt);
+                 margin:var(--sp-4) 0 var(--sp-2);
+                 letter-spacing:.1em; text-transform:uppercase; }
+.confirm-msg { font-size:var(--fs-sm); color:var(--dim);
+               margin-bottom:calc(18 * var(--u)); line-height:1.55; }
+.confirm-actions { display:flex; gap:var(--sp-4); }
+.confirm-actions button { flex:1; min-height:calc(32 * var(--u)); font-size:var(--fs-sm); }
 
-::-webkit-scrollbar { width:7px; height:7px; }
-::-webkit-scrollbar-thumb { background:var(--edge2); border-radius:4px; }
+::-webkit-scrollbar { width:8px; height:8px; }
+::-webkit-scrollbar-thumb { background:var(--line-2); border-radius:4px;
+                            border:2px solid transparent; background-clip:padding-box; }
+::-webkit-scrollbar-thumb:hover { background:var(--line-3); background-clip:padding-box; }
 ::-webkit-scrollbar-track { background:transparent; }
 
-/* ---------- flight-mode / aux-switch announcement (translucent) ---------- */
+/* =========================== mode / aux announcement =========================== */
 #mode-toast {
-  position:fixed; top:66px; left:50%;
-  transform:translateX(-50%) translateY(-10px);
+  position:fixed; top:calc(76 * var(--u)); left:50%;
+  transform:translateX(-50%) translateY(-12px) scale(.97);
   z-index:4000; pointer-events:none;
-  padding:14px 32px; border-radius:14px;
-  font-size:26px; font-weight:700; letter-spacing:2px; white-space:nowrap;
-  color:#fff; background:rgba(10,16,20,.42);
+  padding:calc(12 * var(--u)) calc(30 * var(--u)); border-radius:14px;
+  font-family:var(--ui);
+  font-size:calc(23 * var(--u)); font-weight:700; letter-spacing:.12em;
+  white-space:nowrap; text-transform:uppercase;
+  color:#fff; background:rgba(6,10,14,.5);
   border:1px solid rgba(255,255,255,.22);
-  -webkit-backdrop-filter:blur(10px) saturate(120%);
-          backdrop-filter:blur(10px) saturate(120%);
-  box-shadow:0 8px 32px rgba(0,0,0,.45);
-  text-shadow:0 2px 8px rgba(0,0,0,.6);
-  opacity:0; transition:opacity .25s ease, transform .25s ease;
+  -webkit-backdrop-filter:blur(14px) saturate(130%);
+          backdrop-filter:blur(14px) saturate(130%);
+  box-shadow:0 12px 40px rgba(0,0,0,.55), var(--sheen);
+  text-shadow:0 2px 10px rgba(0,0,0,.7);
+  opacity:0; transition:opacity .25s ease, transform .25s cubic-bezier(.2,.9,.3,1);
 }
-#mode-toast.show { opacity:1; transform:translateX(-50%) translateY(0); }
-#mode-toast.good { border-color:var(--green); }
-#mode-toast.warn { border-color:var(--amber); color:var(--amber); }
-#mode-toast.bad  { border-color:var(--red);   color:var(--red); }
+#mode-toast.show { opacity:1; transform:translateX(-50%) translateY(0) scale(1); }
+#mode-toast.good { border-color:var(--green); box-shadow:0 12px 40px rgba(0,0,0,.55), 0 0 40px -8px var(--green-gl); }
+#mode-toast.warn { border-color:var(--amber); color:var(--amber);
+                   box-shadow:0 12px 40px rgba(0,0,0,.55), 0 0 40px -8px var(--amber-gl); }
+#mode-toast.bad  { border-color:var(--red); color:var(--red);
+                   box-shadow:0 12px 40px rgba(0,0,0,.55), 0 0 40px -8px var(--red-gl); }
 
-/* ---------- emergency-brake distance tuning control (temporary) ---------- */
-.brake-tune { margin-top:8px; display:flex; flex-direction:column; gap:4px; }
-.brake-tune label { font-size:11px; color:var(--dim); letter-spacing:.5px; }
+/* =========================== brake tuning =========================== */
+.brake-tune { margin-top:var(--sp-3); display:flex; flex-direction:column; gap:var(--sp-2);
+              padding-top:var(--sp-3); border-top:1px solid var(--line); }
+.brake-tune label { font-size:var(--fs-micro); color:var(--dim); letter-spacing:.1em;
+                    text-transform:uppercase; }
 .brake-tune input[type="number"] {
-  width:56px; background:var(--btn); border:1px solid var(--btn-edge);
-  color:var(--amber); font-weight:600; border-radius:4px; padding:2px 4px;
+  width:calc(56 * var(--u)); background:var(--surf-3); border:1px solid var(--btn-edge);
+  color:var(--amber); font-weight:700; border-radius:var(--r-sm);
+  padding:calc(3 * var(--u)) calc(5 * var(--u));
+  font-family:var(--mono); font-variant-numeric:tabular-nums;
+  box-shadow:inset 0 1px 2px rgba(0,0,0,.3);
 }
 .brake-tune input[type="range"] { width:100%; accent-color:var(--red); cursor:pointer; }
 
-/* ---------- delivery (Firebase order -> flight) ---------- */
+/* =========================== delivery =========================== */
 /* The sidebar card is the operator's decision surface: what was ordered, how
    far it is, and the two buttons that commit or stop the aircraft. Colour is
    driven entirely by the phase badge so the panel reads at a glance. */
-.link-dot { font-size:9px; color:var(--dim2); }
-.link-dot.online   { color:var(--green); }
+.link-dot { font-size:calc(9 * var(--u)); color:var(--dim2); }
+.link-dot.online   { color:var(--green); text-shadow:0 0 8px var(--green-gl); }
 .link-dot.error,
 .link-dot.no-credentials { color:var(--red); }
-.link-dot.connecting { color:var(--amber); }
+.link-dot.connecting { color:var(--amber); animation:dlv-pulse 1.4s ease-in-out infinite; }
 
 .dlv-card {
-  background:var(--panel2); border:1px solid var(--edge);
-  border-radius:5px; padding:6px; margin-bottom:6px;
+  background:var(--panel2); border:1px solid var(--line);
+  border-radius:var(--r-sm); padding:var(--sp-2); margin-bottom:var(--sp-2);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.03);
 }
-.dlv-phase { display:flex; align-items:center; gap:5px; margin-bottom:4px; }
+.dlv-phase { display:flex; align-items:center; gap:var(--sp-2); margin-bottom:var(--sp-2); }
 .dlv-badge {
-  font-size:9px; font-weight:700; letter-spacing:.6px; padding:2px 5px;
-  border-radius:3px; background:var(--btn); color:var(--dim);
-  border:1px solid var(--btn-edge);
+  font-size:var(--fs-micro); font-weight:700; letter-spacing:.1em;
+  padding:calc(2 * var(--u)) calc(6 * var(--u));
+  border-radius:3px; background:var(--surf-3); color:var(--dim);
+  border:1px solid var(--line-2); text-transform:uppercase;
 }
 .dlv-badge.pending   { background:var(--amberbg); color:var(--amber); border-color:var(--amber); }
 .dlv-badge.enroute,
 .dlv-badge.accepted  { background:var(--greenbg); color:var(--green); border-color:var(--green); }
-.dlv-badge.hovering  { background:var(--greenbg); color:var(--cyan);  border-color:var(--cyan);
+.dlv-badge.hovering  { background:var(--cyanbg); color:var(--cyan);  border-color:var(--cyan);
                        animation:dlv-pulse 1.4s ease-in-out infinite; }
 .dlv-badge.returning { background:var(--amberbg); color:var(--amber); border-color:var(--amber); }
 .dlv-badge.landed    { background:var(--greenbg); color:var(--green); border-color:var(--green); }
@@ -303,113 +804,328 @@ body.radar-expanded #radar { max-width:min(80vh,80vw); }
 .dlv-badge.aborted   { background:var(--redbg);   color:var(--red);   border-color:var(--red); }
 @keyframes dlv-pulse { 0%,100% { opacity:1; } 50% { opacity:.45; } }
 
-.dlv-order { font-size:10px; color:var(--dim); overflow:hidden;
-             text-overflow:ellipsis; white-space:nowrap; }
-.dlv-msg   { font-size:10px; color:var(--txt); line-height:1.35; margin-bottom:5px;
-             min-height:26px; }
-.dlv-grid  { display:grid; grid-template-columns:auto 1fr; gap:1px 6px; font-size:10px; }
+.dlv-order { font-size:var(--fs-micro); color:var(--dim); overflow:hidden;
+             text-overflow:ellipsis; white-space:nowrap; font-family:var(--mono); }
+.dlv-msg   { font-size:var(--fs-micro); color:var(--txt); line-height:1.4;
+             margin-bottom:var(--sp-2); min-height:calc(24 * var(--u)); }
+.dlv-grid  { display:grid; grid-template-columns:auto 1fr;
+             gap:calc(2 * var(--u)) var(--sp-3); font-size:var(--fs-micro); }
+
+/* The verdict block. Hidden until there is an order to have a verdict about. */
+.dlv-outcome { display:none; margin-top:var(--sp-2);
+               padding:var(--sp-2); border-radius:var(--r-sm);
+               border:1px solid var(--line-2); background:var(--surf-3); }
+.dlv-outcome.on { display:block; }
+.dlv-outcome.final { border-color:var(--dim2); }
+.dlv-outcome-hd { font-size:var(--fs-micro); font-weight:700; letter-spacing:.08em;
+                  margin-bottom:var(--sp-1); line-height:1.35; text-transform:uppercase; }
+.dlv-outcome-grid b.good { color:var(--green); }
+.dlv-outcome-grid b.bad  { color:var(--red); }
+.dlv-outcome-grid b.warn { color:var(--amber); }
+.dlv-outcome-grid b.dim  { color:var(--dim); }
+.dlv-outcome-hd.good { color:var(--green); }
+.dlv-outcome-hd.bad  { color:var(--red); }
+.dlv-outcome-hd.warn { color:var(--amber); }
+.dlv-outcome-hd.dim  { color:var(--dim); }
+.dlv-outcome-why { font-size:var(--fs-micro); color:var(--dim); line-height:1.4;
+                   margin-top:var(--sp-1); }
 .dlv-grid span { color:var(--dim); }
 .dlv-grid b    { text-align:right; }
 
 /* Hover countdown / route progress. Width is the only thing JS touches. */
-.dlv-bar-wrap { height:3px; background:var(--edge); border-radius:2px;
-                margin-top:6px; overflow:hidden; display:none; }
+.dlv-bar-wrap { height:calc(4 * var(--u)); background:var(--surf-3); border-radius:2px;
+                margin-top:var(--sp-2); overflow:hidden; display:none;
+                box-shadow:inset 0 1px 2px rgba(0,0,0,.3); }
 .dlv-bar-wrap.on { display:block; }
-.dlv-bar { height:100%; width:0%; background:var(--cyan); transition:width .3s linear; }
+.dlv-bar { height:100%; width:0%;
+           background:linear-gradient(90deg, color-mix(in srgb, var(--cyan) 55%, transparent), var(--cyan));
+           box-shadow:0 0 10px var(--cyan-gl); transition:width .3s linear; }
 
-#sect-delivery button:disabled { opacity:.35; cursor:not-allowed; }
+#sect-delivery button:disabled { opacity:.32; cursor:not-allowed; }
 .hd-badge {
-  font-size:9px; font-weight:700; padding:1px 5px; border-radius:3px;
-  background:var(--btn); color:var(--dim); border:1px solid var(--btn-edge);
+  font-size:var(--fs-micro); font-weight:700;
+  padding:calc(1.5 * var(--u)) calc(6 * var(--u)); border-radius:3px;
+  background:var(--surf-3); color:var(--dim); border:1px solid var(--line-2);
+  letter-spacing:.07em;
 }
 
-/* ---------- delivery: order inbox ---------- */
-/* The inbox is the answer to "I placed an order, did it arrive?" - every order
-   the app has written shows up here whether or not anyone accepts it. */
+/* order inbox - the answer to "I placed an order, did it arrive?" */
 .dlv-count {
-  font-size:9px; font-weight:700; padding:0 4px; border-radius:7px;
-  background:var(--btn); color:var(--dim); border:1px solid var(--btn-edge);
+  font-size:var(--fs-micro); font-weight:700; padding:0 calc(5 * var(--u));
+  border-radius:8px; background:var(--surf-3); color:var(--dim);
+  border:1px solid var(--line-2); font-family:var(--mono);
 }
-.dlv-count.has { background:var(--amberbg); color:var(--amber); border-color:var(--amber); }
+.dlv-count.has { background:var(--amberbg); color:var(--amber); border-color:var(--amber);
+                 box-shadow:0 0 10px -2px var(--amber-gl); }
 .icon-btn {
   background:none; border:none; color:var(--dim); cursor:pointer;
-  font-size:12px; padding:0 2px; line-height:1;
+  font-size:var(--fs-sm); padding:0 calc(3 * var(--u)); line-height:1;
+  min-height:0; box-shadow:none;
 }
-.icon-btn:hover { color:var(--cyan); }
+.icon-btn:hover { color:var(--cyan); background:none; }
 .icon-btn.spin { animation:dlv-spin .6s linear; }
 @keyframes dlv-spin { to { transform:rotate(360deg); } }
 
-.dlv-inbox { max-height:112px; overflow-y:auto; margin-bottom:6px; }
+.dlv-inbox { max-height:calc(110 * var(--u)); overflow-y:auto; margin-bottom:var(--sp-2); }
 .dlv-inbox:empty { display:none; }
 .dlv-row {
-  display:grid; grid-template-columns:1fr auto; gap:0 6px;
-  align-items:center; padding:4px 5px; margin-bottom:3px;
-  background:var(--panel2); border:1px solid var(--edge);
+  display:grid; grid-template-columns:1fr auto; gap:0 var(--sp-3);
+  align-items:center; padding:calc(4 * var(--u)) calc(6 * var(--u));
+  margin-bottom:calc(3 * var(--u));
+  background:var(--panel2); border:1px solid var(--line);
   border-left:2px solid var(--dim2);
-  border-radius:4px; cursor:pointer; font-size:10px;
+  border-radius:var(--r-sm); cursor:pointer; font-size:var(--fs-micro);
+  transition:background .14s, border-color .14s, transform .1s;
 }
-.dlv-row:hover { background:var(--btn-h); border-color:var(--edge2); }
-.dlv-row.sel   { border-left-color:var(--cyan); background:var(--btn-h); }
+.dlv-row:hover { background:var(--surf-3); border-color:var(--line-2); transform:translateX(1px); }
+.dlv-row.sel   { border-left-color:var(--cyan); background:var(--cyanbg);
+                 box-shadow:0 0 14px -5px var(--cyan-gl); }
 .dlv-row.blocked { cursor:not-allowed; opacity:.55; border-left-color:var(--red); }
 .dlv-row.done  { opacity:.5; cursor:default; border-left-color:var(--green); }
 .dlv-row-id   { font-weight:700; color:var(--txt); overflow:hidden;
                 text-overflow:ellipsis; white-space:nowrap; }
-.dlv-row-dist { color:var(--cyan); font-variant-numeric:tabular-nums; }
-.dlv-row-sub  { grid-column:1 / -1; color:var(--dim); font-size:9px;
+.dlv-row-dist { color:var(--cyan); font-variant-numeric:tabular-nums; font-weight:600; }
+.dlv-row-sub  { grid-column:1 / -1; color:var(--dim); font-size:var(--fs-micro);
                 overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.dlv-empty { font-size:10px; color:var(--dim); padding:6px 2px; }
+.dlv-empty { font-size:var(--fs-micro); color:var(--dim); padding:var(--sp-2) 2px; }
 
 /* Phase timeline: ORDER -> LAUNCH -> EN ROUTE -> HOVER -> RETURN -> HOME */
-.dlv-track { display:flex; align-items:center; gap:3px; margin:5px 0 6px; }
-.dlv-step  { flex:1; height:3px; border-radius:2px; background:var(--edge); position:relative; }
-.dlv-step.on   { background:var(--cyan); }
+.dlv-track { display:flex; align-items:center; gap:calc(3 * var(--u));
+             margin:var(--sp-2) 0; }
+.dlv-step  { flex:1; height:calc(4 * var(--u)); border-radius:2px;
+             background:var(--surf-3); position:relative;
+             transition:background .25s ease, box-shadow .25s ease; }
+.dlv-step.on   { background:var(--cyan);  box-shadow:0 0 10px -1px var(--cyan-gl); }
 .dlv-step.done { background:var(--green); }
-.dlv-step.bad  { background:var(--red); }
-.dlv-track-labels { display:flex; justify-content:space-between;
-                    font-size:8px; color:var(--dim2); letter-spacing:.4px; }
+.dlv-step.bad  { background:var(--red);   box-shadow:0 0 10px -1px var(--red-gl); }
+/* Six labels across a ~190px column - they collide the moment they get any
+   tracking, so this one micro-label stays untracked. */
+.dlv-track-labels { display:flex; justify-content:space-between; gap:2px;
+                    font-size:calc(7 * var(--u)); color:var(--dim2);
+                    letter-spacing:0; text-transform:uppercase; }
+.dlv-track-labels span { white-space:nowrap; }
 
 .dlv-setup {
-  font-size:9px; line-height:1.4; color:var(--amber);
+  font-size:var(--fs-micro); line-height:1.45; color:var(--amber);
   background:var(--amberbg); border:1px solid var(--amber);
-  border-radius:4px; padding:5px 6px; margin-top:6px; display:none;
+  border-radius:var(--r-sm); padding:var(--sp-2); margin-top:var(--sp-2); display:none;
 }
 .dlv-setup.on { display:block; }
-.dlv-setup code { color:var(--txt); font-size:9px; }
+.dlv-setup code { color:var(--txt); font-size:var(--fs-micro); font-family:var(--mono); }
 
 /* Bottom panel: the whole order book. */
-.dlv-book { font-size:10px; overflow-y:auto; max-height:100%; }
+.dlv-book { font-size:var(--fs-micro); overflow-y:auto; max-height:100%; }
 .dlv-book table { width:100%; border-collapse:collapse; }
 .dlv-book th {
-  text-align:left; font-size:9px; color:var(--dim); font-weight:600;
-  letter-spacing:.5px; padding:2px 4px; border-bottom:1px solid var(--edge);
-  position:sticky; top:0; background:var(--panel);
+  text-align:left; font-size:var(--fs-micro); color:var(--dim); font-weight:700;
+  letter-spacing:.12em; text-transform:uppercase;
+  padding:calc(3 * var(--u)) calc(5 * var(--u));
+  border-bottom:1px solid var(--line-2);
+  position:sticky; top:0; background:var(--surf-2); z-index:1;
 }
-.dlv-book td { padding:2px 4px; border-bottom:1px solid var(--panel2); }
+.dlv-book td { padding:calc(3 * var(--u)) calc(5 * var(--u));
+               border-bottom:1px solid color-mix(in srgb, var(--line) 55%, transparent); }
 .dlv-book tr.live td { color:var(--cyan); }
 .dlv-book tr.pick { cursor:pointer; }
-.dlv-book tr.pick:hover td { background:var(--btn-h); }
-.pill {
-  font-size:8px; font-weight:700; padding:1px 4px; border-radius:3px;
-  background:var(--btn); color:var(--dim); border:1px solid var(--btn-edge);
+.dlv-book tr.pick:hover td { background:var(--surf-3); }
+/* order-book status pills - deliberately smaller than the header pills */
+.dlv-book .pill, .pill.dispatched, .pill.delivered, .pill.cancelled,
+.pill.flying, .pill.aborted, .pill.rejected {
+  font-size:calc(8 * var(--u)); font-weight:700;
+  padding:1px calc(5 * var(--u)); border-radius:3px;
+  background:var(--surf-3); color:var(--dim); border:1px solid var(--line-2);
+  letter-spacing:.08em; text-transform:uppercase;
 }
 .pill.dispatched { background:var(--amberbg); color:var(--amber); border-color:var(--amber); }
 .pill.delivered  { background:var(--greenbg); color:var(--green); border-color:var(--green); }
 .pill.cancelled  { background:var(--redbg);   color:var(--red);   border-color:var(--red); }
-.pill.flying     { background:var(--greenbg); color:var(--cyan);  border-color:var(--cyan); }
+.pill.flying     { background:var(--cyanbg);  color:var(--cyan);  border-color:var(--cyan); }
 .pill.aborted, .pill.rejected { background:var(--redbg); color:var(--red); border-color:var(--red); }
 
 .repeat-btn {
-  font-size:9px; font-weight:600; padding:1px 6px; border-radius:3px;
-  background:var(--btn); color:var(--dim); border:1px solid var(--btn-edge);
-  cursor:pointer; white-space:nowrap;
+  font-size:var(--fs-micro); font-weight:600;
+  padding:1px calc(6 * var(--u)); border-radius:3px;
+  background:var(--surf-3); color:var(--dim); border:1px solid var(--line-2);
+  cursor:pointer; white-space:nowrap; min-height:0; letter-spacing:.06em;
 }
-.repeat-btn:hover { color:var(--cyan); border-color:var(--cyan); }
+.repeat-btn:hover { color:var(--cyan); border-color:var(--cyan); background:var(--cyanbg); }
 
 /* Map: the drop point and the leg the aircraft is flying to reach it. */
 .dlv-target-icon {
-  width:22px; height:22px; border-radius:50%;
-  border:2px solid var(--cyan); background:rgba(34,211,238,.18);
+  width:calc(22 * var(--u)); height:calc(22 * var(--u)); border-radius:50%;
+  border:2px solid var(--cyan); background:rgba(53,214,242,.18);
   display:flex; align-items:center; justify-content:center;
-  font-size:12px; color:var(--cyan); box-shadow:0 0 10px rgba(34,211,238,.5);
+  font-size:var(--fs-sm); color:var(--cyan); box-shadow:0 0 14px var(--cyan-gl);
 }
 .dlv-target-icon.hovering { animation:dlv-pulse 1.4s ease-in-out infinite; }
+
+/* AUX6 servo DOWN/UP buttons, sat above the camera feed (index.html
+   "cam-servo"). Two equal halves so neither reads as the default action -
+   both are deliberate commands to a mechanism. */
+.cam-servo { display:flex; gap:var(--sp-2); width:var(--cam-w); }  /* == .cam width */
+.cam-servo .srv-btn {
+  flex:1; font-variant-numeric:tabular-nums;
+  background:var(--glass); border-color:var(--line-2);
+  -webkit-backdrop-filter:blur(10px) saturate(130%);
+          backdrop-filter:blur(10px) saturate(130%);
+  box-shadow:var(--e2), var(--sheen);
+}
+
+/* Payload servo tuning (see index.html "PAYLOAD"). Mirrors .brake-tune so the
+   two commissioning controls read as the same kind of thing. */
+.srv-tune { margin-top:var(--sp-3); padding-top:var(--sp-3); border-top:1px solid var(--line); }
+.srv-tune label { display:block; font-size:var(--fs-micro); color:var(--dim);
+                  letter-spacing:.1em; text-transform:uppercase; }
+.srv-tune input[type="number"] {
+  width:calc(56 * var(--u)); background:var(--surf-3); border:1px solid var(--btn-edge);
+  color:var(--amber); font-weight:700; border-radius:var(--r-sm);
+  padding:calc(3 * var(--u)) calc(5 * var(--u));
+  font-family:var(--mono); font-variant-numeric:tabular-nums;
+  box-shadow:inset 0 1px 2px rgba(0,0,0,.3);
+}
+.srv-tune input[type="range"] { width:100%; margin:var(--sp-2) 0 var(--sp-1);
+                                accent-color:var(--cyan); cursor:pointer; }
+.srv-readout { display:flex; justify-content:space-between;
+               font-variant-numeric:tabular-nums; font-size:var(--fs-micro); color:var(--dim); }
+#srv-us, #aux2-us { font-weight:700; color:var(--cyan); }
+.srv-marks { font-size:var(--fs-micro); color:var(--dim2);
+             font-variant-numeric:tabular-nums; margin-top:var(--sp-1);
+             display:flex; justify-content:space-between; }
+
+/* =========================== responsive + motion =========================== */
+/* ---- laptop / small desktop: keep the three-column shell, drop one gauge ---- */
+@media (max-width:1180px) {
+  .hud-cell:nth-of-type(3) { display:none; }   /* VERT SPD is the first to go */
+}
+
+/* ---- tablet & below: the grid stops being a grid ----
+   Below this width there is no honest way to keep a map, a radar, a control
+   column and six panels side by side. The shell becomes a vertical flow, the
+   map keeps a fixed slice of the viewport, and the page scrolls. */
+@media (max-width:1020px) {
+  html, body { height:auto; }
+  #hdr { position:sticky; top:0; }
+  .app {
+    display:flex; flex-direction:column;
+    height:auto; min-height:0;
+  }
+  .hudbar    { order:0; flex:0 0 auto; height:auto; min-height:var(--hud-h);
+               flex-wrap:wrap; padding:var(--sp-2) var(--sp-3); gap:var(--sp-2) 0; }
+  .map-panel { order:1; height:46vh; min-height:260px; flex:0 0 auto; }
+  .col-radar { order:2; flex-direction:row; align-items:stretch; flex:0 0 auto; }
+  .col-radar .radar-panel { flex:0 0 auto; width:calc(240 * var(--u)); }
+  .col-radar .modes-panel { flex:1 1 auto; }
+  .sidebar   { order:3; overflow:visible;
+               display:grid; grid-template-columns:repeat(auto-fill,minmax(216px,1fr));
+               gap:var(--sp-3); align-items:start; }
+  .bottom    { order:4; grid-template-columns:repeat(auto-fit,minmax(230px,1fr)); }
+  .bottom .panel { max-height:calc(300 * var(--u)); }
+  .hud-cell  { flex:1 1 calc(25% - 1px); }
+}
+
+/* ---- phone ---- */
+@media (max-width:700px) {
+  :root { --cam-w:min(calc(228 * var(--u)), 48vw); }
+  #hdr { gap:var(--sp-3); padding:0 var(--sp-3); overflow:hidden; }
+  .brand-sub { display:none; }
+  .pills { flex-wrap:nowrap; overflow:hidden; }
+  .chips { gap:var(--sp-3); }
+  .chip:nth-of-type(3), .chip-time { display:none; }   /* PKT + clock go first */
+  .hud-compass { display:none; }
+  .hud-cell { flex:1 1 calc(33.333% - 1px); border-left:0; }
+  .hud-cell b { font-size:calc(var(--fs-hud) * .82); }
+  .hud-u { position:static; margin-left:.3em; }
+  .col-radar { flex-direction:column; }
+  .col-radar .radar-panel { width:auto; }
+  .sidebar, .bottom { grid-template-columns:1fr; }
+  .map-panel { height:42vh; min-height:220px; }
+  #prop3d-wrap { display:none; }          /* the 3D widget is not worth 40% of a phone map */
+  .map-toolbar { max-width:calc(100% - var(--sp-5)); }
+  .bottom .panel { max-height:none; }
+  #mode-toast { font-size:calc(18 * var(--u)); padding:calc(10 * var(--u)) calc(18 * var(--u));
+                max-width:92vw; white-space:normal; text-align:center; }
+}
+
+/* ---- touch: fingers need a bigger target than a mouse ---- */
+@media (pointer:coarse) {
+  :root { --ctl-h:calc(32 * var(--u)); }
+  .radar-zoom button { width:calc(26 * var(--u)); height:calc(26 * var(--u));
+                       min-height:calc(26 * var(--u)); }
+  .icon-btn { padding:calc(6 * var(--u)); }
+  .theme-btn { width:calc(30 * var(--u)); height:calc(28 * var(--u)); }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration:.01ms !important;
+                           animation-iteration-count:1 !important;
+                           transition-duration:.01ms !important; }
+}
+
+/* =========================== flight recording =========================== */
+/* Badge sits inside .cams (see index.html), matched to the tile's width so the
+   overlay reads as one stack. Only existing theme tokens are used - every one
+   of them is declared in BOTH the dark and light blocks, which is the rule a
+   new derived token would have had to follow too (CLAUDE.md §5). */
+.cam-rec {
+  display:flex; align-items:center; gap:var(--sp-2);
+  width:var(--cam-w);                      /* == .cam / .cam-servo width */
+}
+.cam-rec .rec-label {
+  flex:1; min-width:0; white-space:nowrap; overflow:hidden;
+  font-family:var(--mono); font-size:var(--fs-micro); letter-spacing:.08em;
+  font-variant-numeric:tabular-nums; color:var(--dim);
+}
+.cam-rec .rec-btn {
+  flex:0 0 auto;
+  background:var(--glass); border-color:var(--line-2);
+  -webkit-backdrop-filter:blur(10px) saturate(130%);
+          backdrop-filter:blur(10px) saturate(130%);
+  box-shadow:var(--e2), var(--sheen);
+}
+.cam-rec .rec-btn[aria-pressed="true"] { color:var(--cyan); border-color:var(--cyan); }
+
+.rec-dot {
+  flex:0 0 auto; border-radius:50%;
+  width:calc(8 * var(--u)); height:calc(8 * var(--u));
+  background:var(--dim2);
+}
+.rec-dot.live  { background:var(--red);   box-shadow:0 0 0 calc(3 * var(--u)) var(--red-gl);
+                 animation:rec-pulse 1.4s ease-in-out infinite; }
+.rec-dot.busy  { background:var(--amber); }
+.rec-dot.ready { background:var(--green); }
+.rec-dot.err   { background:var(--red); }
+/* Deliberately scoped to this 8px dot. The radar canvas is never animated or
+   overlaid - a moving element there can mask a real obstacle return. */
+@keyframes rec-pulse { 0%,100% { opacity:1; } 50% { opacity:.3; } }
+@media (prefers-reduced-motion:reduce) { .rec-dot.live { animation:none; } }
+
+/* Replay overlay. Below the safety confirm (5000) on purpose: an arm/disarm
+   confirmation must never end up behind a video window. */
+.rec-modal {
+  position:fixed; inset:0; z-index:4500; display:none;
+  align-items:center; justify-content:center;
+  background:rgba(0,0,0,.72); padding:var(--sp-4);
+  -webkit-backdrop-filter:blur(3px); backdrop-filter:blur(3px);
+}
+.rec-modal.show { display:flex; animation:fade-in .16s ease-out; }
+.rec-modal-in {
+  width:min(calc(900 * var(--u)), 94vw); max-height:92vh;
+  display:flex; flex-direction:column; gap:var(--sp-3);
+  background:var(--panel); border:1px solid var(--line-2);
+  border-radius:var(--r-lg); padding:var(--sp-4); box-shadow:var(--e3);
+}
+.rec-modal-hd {
+  display:flex; align-items:center; gap:var(--sp-3); flex-wrap:wrap;
+  font-size:var(--fs-micro); letter-spacing:.14em; color:var(--txt);
+}
+.rec-modal-hd .rec-meta {
+  flex:1; min-width:0; color:var(--dim); font-family:var(--mono);
+  letter-spacing:0; font-variant-numeric:tabular-nums;
+}
+.rec-video {
+  width:100%; max-height:72vh; background:#000;
+  border:1px solid var(--line); border-radius:var(--r-md);
+}
+.rec-empty {
+  padding:var(--sp-5) var(--sp-4); text-align:center;
+  color:var(--dim); font-size:var(--fs-micro); line-height:1.7;
+}

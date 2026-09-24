@@ -49,6 +49,15 @@ class Topics:
     # state - see EVENT_TOPICS below - so a node recreated mid-flight cannot
     # replay a previous order's stale "delivered" signal into a new hold.
     DELIVERY_BLE_RESULT = "/delivery/ble_result"
+    # BlePhoneSignal: RSSI samples of the recipient's live BLE connection and
+    # the phone's own GPS fixes, bridged from the peripheral like the result
+    # above. Samples, not state - never latched, so a recreated navigator
+    # cannot be handed the previous order's phone.
+    BLE_PHONE = "/delivery/ble_phone"
+
+    # --- Vision --------------------------------------------------------------
+    PERSON_LOCK = "/vision/person_lock"   # PersonLockState, camera -> navigator
+    PHONE_HINT = "/vision/phone_hint"     # PhoneHint, navigator -> camera
 
     # --- Command topics ------------------------------------------------------
     # A request to *act*, not a state to observe. The bus refuses to latch
@@ -60,7 +69,7 @@ class Topics:
     # 'takeoff' spinning the props back up with nobody asking.
     #
     # Any new topic carrying an instruction belongs in here.
-    EVENT_TOPICS = frozenset({MISSION_CMD, MAVLINK_CMD, DELIVERY_BLE_RESULT})
+    EVENT_TOPICS = frozenset({MISSION_CMD, MAVLINK_CMD, DELIVERY_BLE_RESULT, BLE_PHONE})
 
     # --- Diagnostics --------------------------------------------------------
     DIAGNOSTICS = "/diagnostics"

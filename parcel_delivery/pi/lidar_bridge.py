@@ -3,7 +3,10 @@
 Runs continuously and independently of the delivery state machine: obstacle
 data should stream whenever the drone is powered, not just during a mission.
 
-The Pi does NO path planning. It only publishes what the lidar sees.
+The Pi does NO path planning. It only publishes what the lidar sees — and only
+the part of it that is worth seeing: the rear wedge is masked out, because it
+contains the airframe itself. See :func:`sector_keep_mask`.
+
 ArduPilot's onboard object avoidance (OA_TYPE = BendyRuler/Dijkstra, with
 PRX_TYPE = MAVLink) does the actual rerouting. See the README.
 
@@ -34,6 +37,14 @@ DISTANCE_UNKNOWN = 65535  # UINT16_MAX -> "no reading in this sector"
 MAV_DISTANCE_SENSOR_LASER = 0
 MAV_FRAME_BODY_FRD = 12
 
+#: Total scanned arc kept, centred on the nose, matching ``lidar.fov_deg`` in
+#: drone_stack's config/real.yaml. 125 deg left + 125 deg right; the remaining
+#: 110 deg directly behind the aircraft is never reported.
+DEFAULT_FOV_DEG = 250.0
+
+#: Boundary tolerance when judging a sector against the FOV edge, in degrees.
+_EPS = 1e-9
+
 # SLAMTEC serial commands (prefixed with 0xA5).
 _CMD_STOP = 0x25
 _CMD_RESET = 0x40
@@ -42,11 +53,62 @@ _CMD_SCAN = 0x20
 _MOTOR_SPINUP_S = 5.0  # the C1 needs several seconds to reach scan speed
 
 
+def wrap_180(deg: float) -> float:
+    """Fold an angle onto [-180, 180), so left and right are symmetric.
+
+    Only ``abs()`` of this is ever used below, so which end of the range 180 deg
+    lands on does not matter to the mask - but it is [-180, 180) here, where
+    drone_stack's ``utils.geometry.wrap_180`` is closed at both ends.
+    """
+    return (deg + 180.0) % 360.0 - 180.0
+
+
+def sector_keep_mask(
+    fov_deg: float = DEFAULT_FOV_DEG, enabled: bool = True
+) -> list[bool]:
+    """Which of the 72 sectors fall inside the scanned window.
+
+    The C1 spins a full circle, but the rear wedge of that circle is not usable
+    data on this airframe: it always contains the aircraft's own tail and legs,
+    plus whatever it happens to be standing next to. Those returns never move,
+    so streaming them as OBSTACLE_DISTANCE makes ArduPilot brake for obstacles
+    that are effectively bolted to the vehicle — which is exactly what a rooftop
+    takeoff looks like to an unmasked scan.
+
+    Masked sectors are left at ``DISTANCE_UNKNOWN`` rather than at some large
+    distance. Be clear about what that buys and what it does not: ArduPilot's
+    proximity database reads *unknown* as **clear**, so this does not stop
+    BendyRuler routing backwards into ground the sensor has never seen. It only
+    stops the FC being fed the airframe. Not turning your back on unscanned
+    ground is a separate mechanism — ``WP_YAW_BEHAVIOR = 1`` plus drone_stack's
+    yaw gate; see ``docs/31aug_status.md`` section 7.
+
+    Judged on each sector's centre, so the kept set is exactly symmetric about
+    the nose: the default 250 deg window keeps 50 sectors (0-24 and 47-71) and
+    leaves the 22 sectors of the rear 110 deg permanently unknown. This is the
+    same rule as drone_stack's ``proximity_node.sector_keep_mask``, so the two
+    stacks hand the flight controller the same picture.
+
+    ``enabled=False`` (or a 360 deg window) returns an all-true mask: a full
+    circle is not a mask.
+    """
+    if not enabled or fov_deg >= 360.0:
+        return [True] * SECTOR_COUNT
+
+    half_deg = max(0.0, min(360.0, fov_deg)) / 2.0
+    keep: list[bool] = []
+    for i in range(SECTOR_COUNT):
+        centre = i * SECTOR_WIDTH_DEG + SECTOR_WIDTH_DEG / 2.0
+        keep.append(abs(wrap_180(centre)) <= half_deg + _EPS)
+    return keep
+
+
 def scan_to_distances(
     scan: Iterable[tuple[float, float]],
     min_distance_cm: int,
     max_distance_cm: int,
     angle_offset_deg: float = 0.0,
+    keep: Sequence[bool] | None = None,
 ) -> list[int]:
     """Bucket a lidar scan into the 72-sector distance array OBSTACLE_DISTANCE wants.
 
@@ -54,7 +116,14 @@ def scan_to_distances(
         scan: iterable of (angle_deg, distance_m) pairs. Angles are measured
             clockwise from the vehicle's nose, as the RPLIDAR reports them.
         min_distance_cm / max_distance_cm: sensor limits, in centimetres.
-        angle_offset_deg: mounting offset applied to every beam.
+        angle_offset_deg: mounting offset applied to every beam. Note this is
+            *added* to the raw clockwise angle, whereas drone_stack negates the
+            raw angle first (it works counter-clockwise) and then adds its
+            offset. The two therefore rotate opposite ways, and the number is
+            not portable between them. It is 0.0 on this airframe.
+        keep: 72-element mask from :func:`sector_keep_mask`. Beams landing in a
+            masked sector are dropped, leaving it ``DISTANCE_UNKNOWN``. ``None``
+            keeps the full circle, which is the pre-mask behaviour.
 
     Returns:
         A 72-element list of centimetre distances. Sectors with no valid
@@ -73,6 +142,11 @@ def scan_to_distances(
 
         corrected = (angle_deg + angle_offset_deg) % 360.0
         sector = int(corrected / SECTOR_WIDTH_DEG) % SECTOR_COUNT
+
+        # Masked before the range compare, so a rear return can never win a
+        # sector it is not allowed to report in.
+        if keep is not None and not keep[sector]:
+            continue
 
         if distance_cm < distances[sector]:
             distances[sector] = distance_cm
@@ -230,6 +304,8 @@ class LidarBridge:
         rate_hz: float = 10.0,
         source_system: int = 255,
         source_component: int = 195,  # MAV_COMP_ID_OBSTACLE_AVOIDANCE
+        fov_enabled: bool = True,
+        fov_deg: float = DEFAULT_FOV_DEG,
     ) -> None:
         self.mavlink_connection = mavlink_connection
         self.lidar_port = lidar_port
@@ -240,6 +316,25 @@ class LidarBridge:
         self.interval_s = 1.0 / rate_hz
         self.source_system = source_system
         self.source_component = source_component
+        self.fov_enabled = bool(fov_enabled)
+        self.fov_deg = float(fov_deg)
+        # Built once: the mask is pure geometry and does not change in flight.
+        self._keep = sector_keep_mask(self.fov_deg, self.fov_enabled)
+        kept = sum(self._keep)
+        if kept < SECTOR_COUNT:
+            logger.info(
+                "lidar FOV mask: %.0f deg window, %d/%d sectors reported, "
+                "rear %.0f deg left unknown",
+                self.fov_deg,
+                kept,
+                SECTOR_COUNT,
+                360.0 - self.fov_deg,
+            )
+        else:
+            logger.warning(
+                "lidar FOV mask DISABLED - the full 360 deg is streamed to the FC, "
+                "including the airframe's own tail"
+            )
 
         self._mav = None
         self._lidar: RPLidarC1 | None = None
@@ -330,6 +425,7 @@ class LidarBridge:
                         self.min_distance_cm,
                         self.max_distance_cm,
                         self.angle_offset_deg,
+                        keep=self._keep,
                     )
                     self.send_obstacle_distance(distances)
             except Exception:  # noqa: BLE001 - the bridge must always recover

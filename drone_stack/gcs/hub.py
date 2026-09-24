@@ -11,6 +11,7 @@ GPS trail and a console feed, tracks publish rates, and exposes:
 """
 from __future__ import annotations
 
+import inspect
 import itertools
 import json
 import logging
@@ -19,14 +20,16 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from drone_stack.bus import MessageBus
 from drone_stack.bus.topics import Topics
 from drone_stack.gcs.cameras import CameraManager
+from drone_stack.gcs.flight_state import FlightEndDetector
+from drone_stack.gcs.recorder import FlightRecorder
 from drone_stack.interfaces.lidar_interface import FovMask
 from drone_stack.launch.bringup import build_supervisor
-from drone_stack.msg import DeliveryBleResult, NavCommand, to_dict
+from drone_stack.msg import BlePhoneSignal, DeliveryBleResult, NavCommand, to_dict
 from drone_stack.srv import ServiceRegistry
 from drone_stack.utils.config import Config
 from drone_stack.utils.geometry import enu_to_geodetic, geodetic_to_enu, haversine_m
@@ -43,6 +46,32 @@ def _sanitize(obj: Any) -> Any:
     if isinstance(obj, (list, tuple)):
         return [_sanitize(v) for v in obj]
     return obj
+
+
+# Replay tail kept after touchdown: enough to see it settle, not the whole
+# dwell the landed inference needed before it was sure.
+_TOUCHDOWN_TAIL_S = 2.0
+
+
+def stop_clip(recorder, flight_end, reason: str) -> dict:
+    """``recorder.stop(reason)``, trimmed back to touchdown when the aircraft
+    came down and has been resting since. Its end time is on the monotonic
+    clock the camera stamps every recorded frame with.
+
+    A module function, not a method: the hub's edge tests drive
+    ``GcsHub._on_armed`` on a bare stub that has no hub methods. A recorder
+    without ``end_t`` support still gets an ordinary untrimmed stop."""
+    td = getattr(flight_end, "touchdown_t", None) if flight_end is not None else None
+    if td is not None and getattr(flight_end, "airborne", False):
+        # Asked of the signature, not by catching TypeError: a TypeError from
+        # INSIDE a real stop() would otherwise trigger a second stop().
+        try:
+            takes_end_t = "end_t" in inspect.signature(recorder.stop).parameters
+        except (TypeError, ValueError):
+            takes_end_t = False
+        if takes_end_t:
+            return recorder.stop(reason, end_t=td + _TOUCHDOWN_TAIL_S)
+    return recorder.stop(reason)
 
 
 class _ConsoleHandler(logging.Handler):
@@ -92,25 +121,110 @@ class GcsHub:
             config.get("lidar.angle_offset_deg", 0.0)
         )
 
+        # Payload servo envelope. Read once here so the clamp below, the UI
+        # buttons and the tuning slider all come from the same numbers - they
+        # used to be duplicated as constants in app.js and drifted out of step
+        # with config/*.yaml and CLAUDE.md, which disagreed three ways.
+        _pl = config.section("payload") or {}
+        _min = int(_pl.get("min_us", 500))
+        _max = int(_pl.get("max_us", 2500))
+        if _min >= _max:                      # nonsense config must not invert
+            _min, _max = 500, 2500
+        self._payload = {
+            "channel": int(_pl.get("out_channel", 12)),
+            "lock_us": int(_pl.get("lock_us", 1100)),
+            "release_us": int(_pl.get("release_us", 1410)),
+            "min_us": _min,
+            "max_us": _max,
+            "deg_span": float(_pl.get("deg_span", 180.0)),
+        }
+
+        # MG90S on Pixhawk AUX6 (FC output SERVO14). A separate mechanism
+        # from the payload servo above, so it gets its own config block and its
+        # own envelope rather than borrowing that one's. The config block is
+        # still named `aux2_servo` for history - see config/default.yaml.
+        _a2 = config.section("aux2_servo") or {}
+        _a2min = int(_a2.get("min_us", 500))
+        _a2max = int(_a2.get("max_us", 2500))
+        if _a2min >= _a2max:                  # nonsense config must not invert
+            _a2min, _a2max = 500, 2500
+        self._aux2_servo = {
+            "channel": int(_a2.get("out_channel", 14)),
+            "min_us": _a2min,
+            "max_us": _a2max,
+            "deg_span": float(_a2.get("deg_span", 180.0)),
+            # The only two angles this servo is ever commanded to. Shipped to
+            # the UI so the buttons read their travel from config, not from
+            # constants of their own.
+            "down_deg": float(_a2.get("down_deg", 165.0)),
+            "up_deg": float(_a2.get("up_deg", 90.0)),
+        }
+
+        # Per-channel travel envelopes. Until this existed, `set_servo` clamped
+        # EVERY channel to the payload servo's limits, so a second servo with
+        # different travel would have been silently truncated to the first
+        # one's range. Payload is inserted last so it wins if a misconfigured
+        # aux2_servo.out_channel collides with it - the payload clamp is the
+        # one guarding a mechanism that has already been broken once.
+        self._servo_envelopes = {
+            self._aux2_servo["channel"]: self._aux2_servo,
+            self._payload["channel"]: self._payload,
+        }
+
         # record / replay
         self._record_fp = None
         self._record_name: str | None = None
         self._replay_frames: list[dict] | None = None
         self._replay_idx = 0
 
-        # live cameras (USB C270 + Pi cam); lazy-start on first stream request.
+        # live camera (Pi cam only since the USB C270 was removed 2026-09-11);
+        # lazy-start on first stream request.
         # Shares self.bus so the novelty-layer overlay processors can publish
         # PersonDetection/SegmentationFrame for DeliveryNode - see
         # cameras.py's own "Novelty layer tap" docstring section.
         self.cameras = CameraManager(
             bus=self.bus,
             enabled=bool(config.get("cameras.enabled", True)),
+            settings=config.get("cameras", {}) or {},
         )
+
+        # Flight video recorder. Taps the Pi camera's already-encoded JPEG
+        # frames (no second encode - see recorder.py) and keeps exactly one
+        # clip, replaced on every flight long enough to be worth keeping.
+        self.recorder = FlightRecorder(config.section("recording") or {},
+                                       filter_cfg=config.get("cameras.filter", {}) or {})
+        _picam = self.cameras.get(1)
+        if _picam is not None and self.recorder.enabled:
+            # Full-resolution frames + motion/lock metadata when the camera has
+            # a record stream configured; the encoded stream bytes otherwise.
+            _picam.set_recorder(self.recorder)
 
         self._console_handler = _ConsoleHandler(self._push_console)
         logging.getLogger("drone").addHandler(self._console_handler)
         self.bus.subscribe(Topics.GPS, self._on_gps)
         self.bus.subscribe(Topics.MISSION_STATE, self._on_mission_state)
+        # Recording follows the ARM edge off the bus, NOT off build_payload().
+        # build_payload runs once per connected WebSocket client, so driving an
+        # edge detector from it would fire once per browser tab - and, worse,
+        # not at all when nobody has the dashboard open. The aircraft records
+        # whether or not anyone is watching.
+        self._was_armed = False
+        # Arming is a permission, not a flight. The RC motor e-stop cuts the
+        # outputs and leaves the aircraft ARMED, so the disarm edge alone never
+        # ended that clip and the replay kept offering the previous flight.
+        # Ticked once per heartbeat from _on_armed's level branch.
+        self.flight_end = FlightEndDetector(config.section("recording") or {})
+        self._flight_end_t: Optional[float] = None
+        # STATUSTEXT since the last ARM edge. A buffer, not just the latest
+        # line: several can land between two heartbeats and the e-stop must
+        # not be overwritten by chatter. Cleared on ARM, so a pre-arm e-stop
+        # can never end the next flight on its first tick.
+        self._fc_texts: deque = deque(maxlen=20)
+        self.bus.subscribe(Topics.ARMED, self._on_armed)
+        self.bus.subscribe(Topics.FC_MESSAGE, self._on_fc_message)
+        # "Did this recording fly?" - the keep rule for short clips. Height
+        # above home, so it is the same test in every flight mode.
+        self.bus.subscribe(Topics.ALTITUDE, self._on_altitude)
 
     # -- lifecycle -----------------------------------------------------------
     def start(self) -> None:
@@ -129,6 +243,13 @@ class GcsHub:
             if self._record_fp is not None:
                 self._record_fp.close()
                 self._record_fp = None
+        # Close the clip first: the camera is about to stop publishing, and
+        # a finished file means the next boot's orphan sweep has nothing to
+        # throw away.
+        try:
+            self.recorder.shutdown()
+        except Exception:  # noqa: BLE001
+            pass
         self.cameras.stop()
         self.supervisor.stop()
 
@@ -141,6 +262,126 @@ class GcsHub:
             "src": name.replace("drone.", ""),
             "msg": msg,
         })
+
+    def _on_fc_message(self, msg) -> None:
+        text = str(getattr(msg, "text", "") or "")
+        if text:
+            self._fc_texts.append(text)
+
+    def _on_altitude(self, msg) -> None:
+        # Deliberately NO "airborne again -> start a new clip" here. One arm
+        # cycle is one clip (flight_state.py), and only one clip is kept, so
+        # a restart would let a short second hop overwrite the flight before
+        # it. The operator ends that case by disarming, which re-arms cleanly.
+        note = getattr(self.recorder, "note_altitude", None)
+        if note is None:
+            return
+        try:
+            note(getattr(msg, "relative_m", None))
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _flight_end_tick(self) -> None:
+        """Once per heartbeat while armed: is the aircraft still flying?"""
+        fe = getattr(self, "flight_end", None)
+        if fe is None or fe.ended or not self.recorder.is_recording():
+            return
+        # Only a clip the ARM edge started. A manual recording is the
+        # operator's to stop.
+        if self.recorder.status().get("reason") != "armed":
+            return
+        hb = self.bus.latest(Topics.HEARTBEAT)
+        mode = self.bus.latest(Topics.FLIGHT_MODE)
+        alt = self.bus.latest(Topics.ALTITUDE)
+        vel = self.bus.latest(Topics.VELOCITY)
+        reason = fe.update(
+            armed=True,
+            mode=str(getattr(mode, "mode_name", "") or ""),
+            system_status=int(getattr(hb, "system_status", 0) or 0),
+            altitude_m=float(getattr(alt, "relative_m", 0.0) or 0.0),
+            ground_speed_ms=float(getattr(vel, "ground_speed_ms", 0.0) or 0.0),
+            vert_speed_ms=float(getattr(alt, "climb_ms", 0.0) or 0.0),
+            fc_text="\n".join(self._fc_texts),
+            now=time.monotonic(),
+        )
+        if reason is None:
+            return
+        # Before mark_ended(): that clears the quiet period touchdown_t reads.
+        result = stop_clip(self.recorder, fe, reason)
+        fe.mark_ended()
+        self._flight_end_t = time.monotonic()
+        self._push_console("WARNING", "rec", f"flight ended ({reason}) while still "
+                           f"armed - clip saved: {result.get('message', '')}")
+
+    def _on_armed(self, msg) -> None:
+        """Start a recording when the aircraft arms, finish it when it disarms.
+
+        Runs on the MAVLink node's publish thread, so both calls below are
+        non-blocking: start() opens a file and spawns a writer, stop() hands
+        the encode to its own thread and returns.
+        """
+        try:
+            armed = bool(getattr(msg, "armed", False))
+        except Exception:  # noqa: BLE001
+            return
+        if armed == self._was_armed:
+            # Not an edge - but the FC repeats its arm state on EVERY heartbeat
+            # (mavlink_interface appends ArmedStatus next to Heartbeat), and the
+            # recorder needs the LEVEL, not the edge. After a GCS restart the
+            # transition it missed is never replayed, so without this
+            # recorder._arm_seen stays False for the whole time the aircraft
+            # sits disarmed on the ground and an owed replay cannot tell
+            # "observed disarmed" from "never heard from the FC" - it would
+            # wait for a whole further flight. Cheap: set_armed only does work
+            # when a render is actually owed, and this branch deliberately does
+            # NOT touch record()/start()/stop(), which must stay edge-driven.
+            try:
+                self.recorder.set_armed(armed)
+                if armed:
+                    self._flight_end_tick()
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        self._was_armed = armed
+        fe = getattr(self, "flight_end", None)
+        ended_early = fe is not None and fe.ended and not armed
+        if fe is not None:
+            fe.arm_edge(armed)
+        if armed and hasattr(self, "_fc_texts"):
+            self._fc_texts.clear()
+            self._flight_end_t = None
+        try:
+            # Order matters. On ARM the recorder is told first, so a pending
+            # render knows not to start behind the recording it is about to be
+            # preempted by. On DISARM the clip is closed first, so the render
+            # it queues is the newest one - then set_armed(False) is the retry
+            # trigger for anything still owed from an earlier flight.
+            if armed:
+                self.recorder.set_armed(True)
+                result = self.recorder.start("armed")
+                # Auto-start telemetry log so the Replay button always has
+                # data for the latest flight without a manual "Record Log".
+                self.record("start")
+            else:
+                # Stop the telemetry log first, then the video recorder.
+                self.record("stop")
+                if ended_early and not self.recorder.is_recording():
+                    # The e-stop already closed and saved this flight's clip;
+                    # stop() here would only log a spurious "not recording".
+                    result = {"ok": True, "message": ""}
+                else:
+                    # Usually it has been sitting on the ground for the
+                    # disarm delay by now: end the replay at touchdown.
+                    result = stop_clip(self.recorder, fe, "disarmed")
+                self.recorder.set_armed(False)
+        except Exception as exc:  # noqa: BLE001
+            self._push_console("ERROR", "rec", f"recorder error: {exc}")
+            return
+        message = result.get("message", "")
+        if message:
+            self._push_console(
+                "INFO" if result.get("ok") else "WARN", "rec", message
+            )
 
     def _on_mission_state(self, msg) -> None:
         """The navigator owns home; the map just draws it."""
@@ -348,6 +589,13 @@ class GcsHub:
             "trail": list(self._trail),
             "scan": scan_payload,
             "lidar_fov": self._lidar_fov,
+            # Servo envelope + preset positions. Sent every frame so the UI
+            # builds its buttons and tuning slider from config rather than
+            # from constants of its own that can silently drift.
+            "payload": self._payload,
+            # Same contract for the independent AUX2 servo: the UI builds its
+            # slider from this rather than from constants of its own.
+            "aux2_servo": self._aux2_servo,
             "obstacles": obstacles,
             "avoidance": to_dict(avoid) if avoid is not None else None,
             "mission": {
@@ -359,11 +607,24 @@ class GcsHub:
                 "pilot_override": getattr(mission, "pilot_override", False),
                 "alt_ceiling_m": getattr(mission, "alt_ceiling_m", 0.0),
                 "arm_refusal": getattr(mission, "arm_refusal", ""),
+                # Drop-point person scan. handshake_open is what the BLE
+                # peripheral reads before it will release the parcel.
+                "scan_stage": getattr(mission, "scan_stage", ""),
+                "scan_left_s": getattr(mission, "scan_left_s", 0.0),
+                "handshake_open": getattr(mission, "handshake_open", True),
+                "phone_lat": getattr(mission, "phone_lat", 0.0),
+                "phone_lon": getattr(mission, "phone_lon", 0.0),
+                "phone_std_m": getattr(mission, "phone_std_m", 0.0),
                 "waypoints": waypoints,
             },
             "delivery": self._delivery_payload(delivery),
             "health": health,
             "cameras": self._camera_info(obstacles),
+            # Recorder state + the kept clip's metadata. Shipped every frame so
+            # the UI builds its badge and its replay link from the hub rather
+            # than from numbers of its own - same contract as `payload` and
+            # `aux2_servo` above.
+            "recording": self.recorder.status(),
             "console": list(self._console)[-60:],
             "replay": {"active": False},
         }
@@ -504,10 +765,28 @@ class GcsHub:
             return self._on_ble_auth_event(p)
         if cmd == "ble_delivery_result":
             return self._on_ble_delivery_result(p)
+        if cmd == "ble_phone_signal":
+            return self._on_ble_phone_signal(p)
+        if cmd == "ble_phone_fix":
+            return self._on_ble_phone_fix(p)
         if cmd == "set_servo":
-            # Payload servo on a Pixhawk AUX output (AUX1 == channel 9).
-            ch = int(p.get("channel", 9))
-            pwm = max(800, min(2200, int(p.get("pwm", 1500))))
+            # Servo on a Pixhawk AUX output: AUX5 == channel 13 (payload
+            # MG995), AUX6 == channel 14 (MG90S). Clamped to the CONFIGURED
+            # envelope for THAT CHANNEL, not a hardcoded one, so narrowing a
+            # servo's min_us/max_us after commissioning actually constrains the
+            # UI slider and the buttons - and one servo's limits never clamp
+            # the other's. An unknown channel falls back to the payload
+            # envelope, which is the conservative choice.
+            ch = int(p.get("channel", self._payload["channel"]))
+            env = self._servo_envelopes.get(ch, self._payload)
+            lo, hi = env["min_us"], env["max_us"]
+            want = int(p.get("pwm", (lo + hi) // 2))
+            pwm = max(lo, min(hi, want))
+            if pwm != want:
+                self._push_console(
+                    "WARN", "gcs",
+                    f"servo ch{ch} {want}us outside envelope {lo}-{hi}us - clamped",
+                )
             self.bus.publish(
                 Topics.MAVLINK_CMD,
                 NavCommand("set_servo", {"channel": ch, "pwm": pwm}),
@@ -515,6 +794,45 @@ class GcsHub:
             aux = ch - 8 if ch >= 9 else ch
             self._push_console("INFO", "gcs", f"servo AUX{aux} (ch{ch}) -> {pwm}us")
             return {"ok": True, "message": f"servo ch{ch} = {pwm}us"}
+        if cmd == "record_start":
+            return self.recorder.start("manual")
+        if cmd == "record_stop":
+            # A recording started by ARMING cannot be stopped from the
+            # dashboard. The operator asked for a clip of every flight, and a
+            # mis-click in the air must not be able to lose one. Disarming is
+            # what ends a flight recording - nothing else.
+            if self.recorder.status().get("reason") == "armed":
+                return {"ok": False,
+                        "message": "armed-flight recording - disarm to end it"}
+            return self.recorder.stop("manual")
+        if cmd == "person_lock":
+            # Manual override: force-enable or disable person lock from the
+            # GCS UI, regardless of mission phase. Also tilts the camera.
+            action = str(p.get("action", "toggle"))
+            cam = self.cameras.get(1) if self.cameras else None
+            if cam is None or getattr(cam, "_vision", None) is None:
+                return {"ok": False, "message": "no camera with person lock"}
+            vision = cam._vision
+            if action == "toggle":
+                new_val = not vision.enabled
+            elif action in ("on", "enable", "true", "1"):
+                new_val = True
+            else:
+                new_val = False
+            vision.enabled = new_val
+            # Tilt camera down when enabling, up when disabling
+            a2 = self._aux2_servo
+            span = a2["max_us"] - a2["min_us"]
+            deg = a2["down_deg"] if new_val else a2["up_deg"]
+            us = int(a2["min_us"] + deg * span / (a2["deg_span"] or 180.0) + 0.5)
+            us = max(a2["min_us"], min(a2["max_us"], us))
+            self.bus.publish(
+                Topics.MAVLINK_CMD,
+                NavCommand("set_servo", {"channel": a2["channel"], "pwm": us}),
+            )
+            state = "ON" if new_val else "OFF"
+            self._push_console("INFO", "gcs", f"person lock {state} (camera {'down' if new_val else 'up'})")
+            return {"ok": True, "message": f"person lock {state}"}
         # direct service passthrough (arm, disarm, rtl, land, hold, resume,
         # start_mission, avoid_enable/disable, scan_start/stop/pause/resume, ...)
         if self.services.has(cmd):
@@ -576,6 +894,39 @@ class GcsHub:
             f"BLE delivery result: order={event.order_id} success={event.success}",
         )
         return {"ok": True, "message": "ble delivery result published"}
+
+    def _on_ble_phone_signal(self, p: dict) -> dict:
+        """A batch of RSSI samples of the live phone connection, from the
+        peripheral's sampler: ``{"order_id", "samples": [[t, rssi_dbm], ...]}``.
+        Each goes on the bus with its own timestamp, so the navigator pairs it
+        with where the aircraft was when it was measured."""
+        order_id = str(p.get("order_id", ""))
+        n = 0
+        for item in (p.get("samples") or [])[:64]:
+            try:
+                t, rssi = float(item[0]), float(item[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if not -127.0 <= rssi < 0.0:
+                continue
+            self.bus.publish(Topics.BLE_PHONE, BlePhoneSignal(
+                order_id=order_id, kind="rssi", rssi_dbm=rssi, t=t), latch=False)
+            n += 1
+        return {"ok": True, "message": f"{n} rssi samples"}
+
+    def _on_ble_phone_fix(self, p: dict) -> dict:
+        """The phone's own GPS fix, as written (HMAC-verified) to the GPS
+        characteristic."""
+        try:
+            lat, lon = float(p["lat"]), float(p["lon"])
+        except (KeyError, TypeError, ValueError):
+            return {"ok": False, "message": "lat/lon required"}
+        if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0) or (lat == 0.0 and lon == 0.0):
+            return {"ok": False, "message": "implausible fix"}
+        self.bus.publish(Topics.BLE_PHONE, BlePhoneSignal(
+            order_id=str(p.get("order_id", "")), kind="gps", lat=lat, lon=lon,
+            t=float(p.get("t", time.time()))), latch=False)
+        return {"ok": True, "message": "phone fix published"}
 
     def _home_or(self, default_lat: float, default_lon: float) -> tuple[float, float]:
         return self._home if self._home is not None else (default_lat, default_lon)

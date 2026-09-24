@@ -5,11 +5,45 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>AERIX GROUND CONTROL</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-<link rel="stylesheet" href="/static/style.css?v=1787400000" />
+<meta name="color-scheme" content="dark light" />
+<meta name="theme-color" content="#000000" />
+<!-- UI type: Chakra Petch (display) / Saira (chrome) / JetBrains Mono
+     (readouts), SELF-HOSTED from /static/fonts. These used to come from
+     fonts.googleapis.com, which meant that in the field - where the operator's
+     laptop is on the aircraft's own network with no route to the internet -
+     every face silently fell back to a system font and the whole --u-scaled
+     layout re-flowed to different metrics than it was tuned on. 250 KB, cached
+     after first load. Regenerate with fonts/selfhost_fonts.py.
+     System fallbacks still stand in style.css (--display / --ui / --mono). -->
+<link rel="preload" as="font" type="font/woff2" crossorigin
+      href="/static/fonts/Saira-500.woff2" />
+<link rel="preload" as="font" type="font/woff2" crossorigin
+      href="/static/fonts/ChakraPetch-600.woff2" />
+<link rel="stylesheet" href="/static/fonts/fonts.css?v=1789801483" />
+<link rel="stylesheet" href="/static/style.css?v=1789801483" />
 </head>
 <body data-theme="dark">
+<!-- Icon set. Stroke-only so every glyph inherits the colour of its panel
+     accent; defined once and referenced with <use>. -->
+<svg class="ico-defs" aria-hidden="true" focusable="false">
+  <symbol id="i-telem" viewBox="0 0 24 24"><path d="M3 17l5-6 4 4 4-7 5 6"/></symbol>
+  <symbol id="i-avoid" viewBox="0 0 24 24"><path d="M12 3l9 16H3z"/><path d="M12 10v4"/><path d="M12 17h.01"/></symbol>
+  <symbol id="i-mission" viewBox="0 0 24 24"><path d="M5 20V5l7-2 7 2v15"/><path d="M5 9h14"/><path d="M12 3v17"/></symbol>
+  <symbol id="i-delivery" viewBox="0 0 24 24"><path d="M3 8l9-4 9 4-9 4z"/><path d="M3 8v8l9 4 9-4V8"/></symbol>
+  <symbol id="i-health" viewBox="0 0 24 24"><path d="M3 12h4l2-5 3 10 2-5h7"/></symbol>
+  <symbol id="i-console" viewBox="0 0 24 24"><path d="M5 8l4 4-4 4"/><path d="M12 16h7"/></symbol>
+  <symbol id="i-radar" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4"/><path d="M12 12L19 7"/></symbol>
+  <symbol id="i-mode" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/><circle cx="9" cy="6" r="2"/><circle cx="15" cy="12" r="2"/><circle cx="7" cy="18" r="2"/></symbol>
+</svg>
+
 <header id="hdr">
-  <div class="title">◈ AERIX&nbsp;GROUND&nbsp;CONTROL</div>
+  <div class="title">
+    <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M12 2l9 19-9-5-9 5z"/>
+    </svg>
+    <span class="brand-name">AERIX</span>
+    <span class="brand-sub">Ground&nbsp;Control</span>
+  </div>
   <div class="pills">
     <span id="pill-link" class="pill bad">LINK LOST</span>
     <span id="pill-source" class="pill">SIM</span>
@@ -17,16 +51,36 @@
     <span id="pill-armed" class="pill bad">DISARMED</span>
   </div>
   <div class="chips">
-    <span class="chip">🛰 <b id="chip-sat">0</b></span>
-    <span class="chip">🔋 <b id="chip-batt">0.0</b>V</span>
-    <span class="chip">▤ <b id="chip-pkt">0</b></span>
-    <span class="chip">🖥 <b id="chip-cpu">0</b>%</span>
-    <span class="chip" id="chip-clock">--:--:--</span>
+    <span class="chip"><span class="chip-k">SAT</span><b id="chip-sat">0</b></span>
+    <span class="chip"><span class="chip-k">BATT</span><b id="chip-batt">0.0</b><span class="chip-u">V</span></span>
+    <span class="chip"><span class="chip-k">PKT</span><b id="chip-pkt">0</b></span>
+    <span class="chip"><span class="chip-k">CPU</span><b id="chip-cpu">0</b><span class="chip-u">%</span></span>
+    <span class="chip chip-time" id="chip-clock">--:--:--</span>
+    <span class="hdr-sep"></span>
+    <button id="density-toggle" class="theme-btn" title="UI density">▪</button>
     <button id="theme-toggle" class="theme-btn" title="Toggle light / dark">☀</button>
   </div>
 </header>
 
 <div class="app">
+  <!-- PRIMARY FLIGHT BAND
+       The six numbers an operator glances at without reading a table. They are
+       deliberately duplicated from the Telemetry panel: that panel is the
+       reference, this is the instrument. Filled by updateHud() in app.js. -->
+  <div class="hudbar">
+    <span id="hud-state" class="hud-state down">NO LINK</span>
+    <div class="hud-cell"><span class="hud-k">ALT</span><b id="hud-alt">--</b><span class="hud-u">m</span></div>
+    <div class="hud-cell"><span class="hud-k">GND SPD</span><b id="hud-gs">--</b><span class="hud-u">m/s</span></div>
+    <div class="hud-cell"><span class="hud-k">VERT SPD</span><b id="hud-vs">--</b><span class="hud-u">m/s</span></div>
+    <div class="hud-cell"><span class="hud-k">HDG</span><b id="hud-hdg">--</b><span class="hud-u">°</span></div>
+    <div class="hud-cell"><span class="hud-k">BATT</span><b id="hud-batt">--</b><span class="hud-u">V</span></div>
+    <div class="hud-cell"><span class="hud-k">SAT</span><b id="hud-sat">--</b><span class="hud-u"></span></div>
+    <div class="hud-compass" title="heading">
+      <span class="hud-n">N</span>
+      <div id="hud-ring" class="hud-ring"></div>
+    </div>
+  </div>
+
   <!-- LEFT SIDEBAR -->
   <aside class="sidebar">
     <div class="sect"><h3>FLIGHT OVERRIDE</h3>
@@ -73,6 +127,21 @@
           <span>ETA</span><b id="dlv-eta">--</b>
         </div>
         <div id="dlv-bar-wrap" class="dlv-bar-wrap"><div id="dlv-bar" class="dlv-bar"></div></div>
+
+        <!-- The verdict, as two independent facts. One word for both is how
+             "DELIVERY COMPLETE" ended up on this panel for a flight that came
+             home with the parcel still aboard: the aircraft's story was fine,
+             the order's was not. -->
+        <div id="dlv-outcome" class="dlv-outcome">
+          <div id="dlv-outcome-hd" class="dlv-outcome-hd">--</div>
+          <div class="dlv-grid dlv-outcome-grid">
+            <span>Parcel</span><b id="dlv-oc-parcel">--</b>
+            <span>Aircraft</span><b id="dlv-oc-return">--</b>
+            <span>Handshake</span><b id="dlv-oc-ble">--</b>
+            <span>From home</span><b id="dlv-oc-home">--</b>
+          </div>
+          <div id="dlv-outcome-why" class="dlv-outcome-why"></div>
+        </div>
       </div>
 
       <div class="btn-row">
@@ -86,7 +155,7 @@
       </div>
       <div id="dlv-setup" class="dlv-setup"></div>
     </div>
-    <div class="sect"><h3>PAYLOAD · AUX1 SERVO</h3>
+    <div class="sect"><h3>PAYLOAD · AUX5 SERVO</h3>
       <div class="btn-row">
         <button id="srv-lock">Lock</button>
       </div>
@@ -130,7 +199,7 @@
   <section class="col-radar">
     <div class="panel radar-panel">
       <div class="panel-hd">
-        <span id="radar-title">SIMULATION</span>
+        <span class="hd-title"><svg class="ico"><use href="#i-radar"/></svg><span id="radar-title">SIMULATION</span></span>
         <span class="radar-status">
           <b id="radar-state">--</b> · <b id="radar-near">--</b> · x<b id="radar-mult">1.0</b>
         </span>
@@ -147,7 +216,7 @@
       </div>
     </div>
     <div class="panel modes-panel">
-      <div class="panel-hd"><span>FLIGHT MODE</span></div>
+      <div class="panel-hd"><span class="hd-title"><svg class="ico"><use href="#i-mode"/></svg>Flight Mode</span></div>
       <div class="mode-status">
         Actual: <b id="mode-actual">--</b> &nbsp; Requested: <b id="mode-req">--</b>
       </div>
@@ -156,7 +225,7 @@
   </section>
 
   <!-- MAP -->
-  <section class="panel map-panel">
+  <section class="panel map-panel" data-accent="map">
     <div class="map-toolbar">
       <span class="layers">
         <button class="lyr" data-layer="street">Street</button>
@@ -177,11 +246,34 @@
       <div>◎ <span id="coord-cursor" class="cyan">--</span></div>
     </div>
     <div class="cams">
-      <div class="cam" id="camwrap0">
-        <img id="camimg0" class="cam-img" alt="" />
-        <div id="camov0" class="cam-ov"></div>
-        <div class="cam-top"><span id="camlbl0">USB --</span><span class="cam-gpu">GPU</span></div>
+      <!-- AUX6 servo (MG90S on FC output SERVO14): the only two positions it is
+           ever commanded to. It lives INSIDE .cams, which is the absolutely
+           positioned camera overlay - as a sibling in normal flow it rendered
+           828px wide at the top of the map panel, hidden behind the map
+           controls. In here it tracks the tile automatically.
+           Both angles come from the aux2_servo config block and are written
+           into the labels on the first frame - do not hardcode them here.
+           Replaced a full-sweep commissioning slider on 2026-09-11. -->
+      <!-- Flight recording badge + replay toggle. Lives INSIDE .cams for
+           exactly the reason the servo buttons below do: .cams is the
+           absolutely positioned camera overlay, and a sibling of it in normal
+           flow renders full-width at the top of the map panel, invisible
+           behind the map controls. See CLAUDE.md §5 "UI layout gotcha".
+           Every value here comes from the hub's `recording` block - the state
+           text, the duration and the clip's size are never computed locally. -->
+      <div class="cam-rec">
+        <span id="rec-dot" class="rec-dot off"></span>
+        <span id="rec-label" class="rec-label">REC IDLE</span>
+        <button id="rec-toggle" class="srv-btn rec-btn" aria-pressed="false"
+                title="Show the last flight's recording">REPLAY</button>
       </div>
+      <div class="cam-servo">
+        <button id="aux2-down" class="srv-btn">DOWN 165°</button>
+        <button id="aux2-up" class="srv-btn">UP 90°</button>
+      </div>
+      <!-- USB camera tile (camwrap0) removed 2026-09-11 with the C270 itself.
+           The Pi camera keeps id 1: routes and infos() are keyed by id, so no
+           renumbering was needed. -->
       <div class="cam" id="camwrap1">
         <img id="camimg1" class="cam-img" alt="" />
         <div id="camov1" class="cam-ov"></div>
@@ -197,13 +289,13 @@
 
   <!-- BOTTOM ROW: 5 PANELS -->
   <section class="bottom">
-    <div class="panel"><div class="panel-hd"><span>● Telemetry</span></div>
+    <div class="panel" data-accent="telem"><div class="panel-hd"><span class="hd-title"><svg class="ico"><use href="#i-telem"/></svg>Telemetry</span></div>
       <table id="tbl-telem" class="kv"></table>
     </div>
-    <div class="panel"><div class="panel-hd"><span>● Avoidance</span></div>
+    <div class="panel" data-accent="avoid"><div class="panel-hd"><span class="hd-title"><svg class="ico"><use href="#i-avoid"/></svg>Avoidance</span></div>
       <table id="tbl-avoid" class="kv"></table>
     </div>
-    <div class="panel"><div class="panel-hd"><span>● Mission</span></div>
+    <div class="panel" data-accent="mission"><div class="panel-hd"><span class="hd-title"><svg class="ico"><use href="#i-mission"/></svg>Mission</span></div>
       <div class="btn-col">
         <button id="ms-save">Save .plan</button>
         <button id="ms-load">Load .plan</button>
@@ -211,16 +303,16 @@
       </div>
       <table id="tbl-mission" class="kv"></table>
     </div>
-    <div class="panel"><div class="panel-hd"><span>● Delivery</span>
+    <div class="panel" data-accent="delivery"><div class="panel-hd"><span class="hd-title"><svg class="ico"><use href="#i-delivery"/></svg>Delivery</span>
         <span id="dlv-hd-phase" class="hd-badge">IDLE</span></div>
       <div id="dlv-book" class="dlv-book"></div>
       <table id="tbl-delivery" class="kv"></table>
     </div>
-    <div class="panel"><div class="panel-hd"><span>● System Health</span></div>
+    <div class="panel" data-accent="health"><div class="panel-hd"><span class="hd-title"><svg class="ico"><use href="#i-health"/></svg>System Health</span></div>
       <table id="tbl-health" class="kv"></table>
       <div id="health-spark" class="sparks"></div>
     </div>
-    <div class="panel console-panel"><div class="panel-hd"><span>● Console</span></div>
+    <div class="panel console-panel" data-accent="console"><div class="panel-hd"><span class="hd-title"><svg class="ico"><use href="#i-console"/></svg>Console</span></div>
       <div id="console" class="console"></div>
       <div class="nl-bar">
         <input id="nl-input" type="text"
@@ -246,8 +338,30 @@
     </div>
   </div>
 </div>
+<!-- Last-flight replay. A full-screen overlay, so unlike the badge above it
+     belongs at body level rather than inside .cams. Shown/hidden with a class
+     rather than the `hidden` attribute, matching .confirm-overlay: a CSS
+     `display:flex` would otherwise win over the UA's [hidden] rule and the
+     overlay would never close. -->
+<div id="rec-modal" class="rec-modal">
+  <div class="rec-modal-in">
+    <div class="rec-modal-hd">
+      <b>LAST FLIGHT</b>
+      <span id="rec-modal-meta" class="rec-meta"></span>
+      <a id="rec-dl" class="srv-btn" href="/api/recording/video"
+         download="aerix-flight.mp4">SAVE</a>
+      <button id="rec-close" class="srv-btn">CLOSE</button>
+    </div>
+    <video id="rec-video" class="rec-video" controls playsinline
+           preload="metadata"></video>
+    <div id="rec-empty" class="rec-empty">
+      No clip yet. The aircraft records automatically whenever it is armed and
+      keeps only the most recent flight.
+    </div>
+  </div>
+</div>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-<script src="/static/app.js?v=1787510000"></script>
+<script src="/static/app.js?v=1790180000"></script>
 <script type="importmap">
 {
   "imports": {

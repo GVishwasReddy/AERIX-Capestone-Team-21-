@@ -405,6 +405,12 @@ class RealMavlink(MavlinkInterface):
                     mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM: "arm/disarm",
                     mavutil.mavlink.MAV_CMD_NAV_TAKEOFF: "takeoff",
                     mavutil.mavlink.MAV_CMD_DO_SET_MODE: "set_mode",
+                    # DO_SET_SERVO was missing here until 2026-08-31, so the
+                    # payload servo was the one command whose REJECTION was
+                    # invisible: the Pi logged "DO_SET_SERVO sent" and the
+                    # aircraft did nothing, with no way to tell a refused
+                    # command from a dead servo or an unpowered supply.
+                    mavutil.mavlink.MAV_CMD_DO_SET_SERVO: "set_servo",
                 }
                 if cmd in names:
                     ok = res == mavutil.mavlink.MAV_RESULT_ACCEPTED
@@ -566,12 +572,25 @@ class RealMavlink(MavlinkInterface):
             self.log.info("PARAM_SET %s = %g", name, value)
             return True
         if cmd == "set_servo":
-            ch = int(p.get("channel", 9))
-            pwm = max(800, min(2200, int(p.get("pwm", 1500))))
+            ch = int(p.get("channel", 13))
+            # Absolute sanity envelope only - the width an RC servo can be
+            # asked for at all. The MECHANISM's limits are payload.min_us /
+            # max_us in config, enforced by GcsHub before the command is
+            # published; this is the backstop for anything that reaches the
+            # link by another route, so it must not be narrower than the
+            # configured envelope or it would silently truncate a legitimate
+            # commissioning sweep. Widened 800-2200 -> 500-2500 on 2026-08-31
+            # for the MG995's full 180 deg travel.
+            pwm = max(500, min(2500, int(p.get("pwm", 1500))))
             # ArduPilot only lets DO_SET_SERVO drive an output that isn't
             # assigned a flight function. Set SERVO{ch}_FUNCTION=0 (Disabled)
-            # once per channel so AUX1 (ch9) responds. Harmless for an unused
-            # aux; persists on the FC.
+            # once per channel so AUX5 (ch13) responds. Harmless for an
+            # unused aux; persists on the FC.
+            #
+            # Servos moved AUX1/AUX2 -> AUX5/AUX6 on 2026-09-06: the FC tracked
+            # servo9_raw/servo10_raw exactly and ACKed every command while the
+            # two pins drove nothing. Nothing here is channel-specific, so the
+            # move was config-only.
             if ch not in self._servo_ready:
                 try:
                     self._master.mav.param_set_send(
@@ -579,7 +598,7 @@ class RealMavlink(MavlinkInterface):
                         f"SERVO{ch}_FUNCTION".encode(), 0.0,
                         mavutil.mavlink.MAV_PARAM_TYPE_INT8,
                     )
-                    self.log.info("set SERVO%d_FUNCTION=0 (payload servo)", ch)
+                    self.log.info("set SERVO%d_FUNCTION=0 (DO_SET_SERVO)", ch)
                 except Exception:  # noqa: BLE001
                     self.log.exception("could not set SERVO%d_FUNCTION", ch)
                 self._servo_ready.add(ch)

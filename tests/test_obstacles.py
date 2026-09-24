@@ -76,6 +76,18 @@ def test_danger_flag_when_close():
     assert obstacles[0].danger is True
 
 
+def test_an_obstacle_straddling_the_nose_has_its_true_angular_width():
+    """Beam 0 is the nose, so anything straight ahead is merged across the
+    0/360 seam. Last-minus-first read that as ~358 deg wide, which blocked
+    the entire VFH+ histogram: no gap anywhere, straight into the brake."""
+    scan = make_scan({358: 3.0, 359: 3.0, 0: 3.0, 1: 3.0, 2: 3.0})
+    o = _node()._detect(scan)[0]
+    assert abs(o.angular_width_deg - 4.0) < 0.5
+
+
 def test_small_clusters_ignored():
-    scan = make_scan({0: 3.0})  # single beam < min_points
+    # Close in, a single beam is far too small for anything min_object_width_m
+    # wide (which fills ~5.7 bins at 1 m). Far out a single beam CAN be a real
+    # pole - see test_long_range_avoidance for how those are gated instead.
+    scan = make_scan({0: 1.0})
     assert _node()._detect(scan) == []

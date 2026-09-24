@@ -55,6 +55,12 @@ Waypoint capture radius, cruise altitude/speed, and the obstacle distances at
 which collision avoidance slows down (`avoidance_distance_m`) and hard-stops
 (`avoidance_stop_m`).
 
+The Pi-side reactive router lives here too: `avoidance_dodge_enabled` turns it
+on at all, and `avoidance_vfh_enabled` chooses VFH+ gap-steering over the older
+three-cone sidestep. The `avoidance_vfh_*` keys tune the histogram. Only one
+router may steer at a time — see `docs/30auglidarintegration.md` §8b before
+enabling either alongside the flight controller's `OA_TYPE`.
+
 ### `web.port`
 Dashboard port (default `8090`). Browse to `http://<pi-ip>:<port>`.
 

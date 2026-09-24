@@ -73,6 +73,76 @@ class DeliveryPhase(str, Enum):
     ABORTED = "ABORTED"              # operator abort or failsafe cut it short
 
 
+class DeliveryOutcome(str, Enum):
+    """What happened to the PARCEL - half of a finished delivery's story.
+
+    Deliberately independent of :class:`ReturnOutcome`. Collapsing the two into
+    one word is what let the panel report "DELIVERY COMPLETE" for a flight that
+    went out, failed the recipient handshake and came home with the parcel
+    still aboard: the aircraft's story was fine, the order's was not.
+    """
+
+    PENDING = "PENDING"              # still in progress, no verdict yet
+    DELIVERED = "DELIVERED"          # BLE drop gate passed for this order
+    FAILED = "FAILED"                # flew the leg, no valid handshake
+    ABORTED = "ABORTED"              # operator abort, pilot takeover, failsafe
+    NEVER_FLEW = "NEVER_FLEW"        # never armed - refused, or given up on
+
+
+class ReturnOutcome(str, Enum):
+    """What happened to the AIRCRAFT - the other half.
+
+    "Returned" means home AND down AND inside ``delivery.home_radius_m``. An
+    aircraft that put itself down in a field is NOT_RETURNED however well the
+    delivery itself went, because someone has to go and fetch it.
+    """
+
+    PENDING = "PENDING"              # still flying
+    RETURNED = "RETURNED"            # disarmed at home, inside the radius
+    NOT_RETURNED = "NOT_RETURNED"    # down somewhere else, or put down hard
+    ON_PAD = "ON_PAD"                # never left the ground
+    UNKNOWN = "UNKNOWN"              # armed, but nothing left to judge it by
+
+
+#: Headline for each (parcel, aircraft) pair, as the GCS shows it. Kept here
+#: rather than in the browser so the node, the Firestore write-back and the
+#: panel cannot drift into describing the same flight three different ways.
+_OUTCOME_HEADLINES: dict[tuple[str, str], str] = {
+    ("DELIVERED", "RETURNED"): "DELIVERED · RETURNED HOME",
+    ("DELIVERED", "NOT_RETURNED"): "DELIVERED · DID NOT RETURN",
+    ("DELIVERED", "PENDING"): "DELIVERED · RETURNING",
+    ("DELIVERED", "UNKNOWN"): "DELIVERED · RETURN UNCONFIRMED",
+    ("FAILED", "RETURNED"): "NOT DELIVERED · RETURNED WITH PARCEL",
+    ("FAILED", "NOT_RETURNED"): "NOT DELIVERED · DID NOT RETURN",
+    ("FAILED", "PENDING"): "NOT DELIVERED · RETURNING",
+    ("FAILED", "UNKNOWN"): "NOT DELIVERED · RETURN UNCONFIRMED",
+    ("ABORTED", "RETURNED"): "ABORTED · RETURNED HOME",
+    ("ABORTED", "NOT_RETURNED"): "ABORTED · DID NOT RETURN",
+    ("ABORTED", "PENDING"): "ABORTED · RETURNING",
+    ("ABORTED", "UNKNOWN"): "ABORTED · RETURN UNCONFIRMED",
+    ("ABORTED", "ON_PAD"): "ABORTED ON THE PAD",
+    ("NEVER_FLEW", "ON_PAD"): "NEVER LAUNCHED",
+}
+
+
+def describe_outcome(
+    outcome: "DeliveryOutcome | str", ret: "ReturnOutcome | str"
+) -> str:
+    """The one-line headline for a (parcel, aircraft) pair.
+
+    Falls back to joining the two raw values rather than raising: an unmapped
+    pair should degrade to something readable on the panel, not blank it.
+    """
+    a = getattr(outcome, "value", outcome)
+    b = getattr(ret, "value", ret)
+    if a == "PENDING":
+        return "IN PROGRESS"
+    known = _OUTCOME_HEADLINES.get((a, b))
+    if known:
+        return known
+    return "%s · %s" % (str(a).replace("_", " "), str(b).replace("_", " "))
+
+
 # ---------------------------------------------------------------------------
 # Base
 # ---------------------------------------------------------------------------
@@ -415,6 +485,18 @@ class MissionState(Message):
     home_lat: float = 0.0
     home_lon: float = 0.0
     home_set: bool = False
+    # Drop-point person scan (2026-09-24). scan_stage is "" outside a scanned
+    # hold, else descend | search | locked. handshake_open is the ONE answer
+    # drone_ble_peripheral.py asks before it releases the parcel: fail closed,
+    # so a GCS that never computed it reads as "not yet".
+    scan_stage: str = ""
+    scan_left_s: float = 0.0
+    handshake_open: bool = False
+    # Where the recipient's phone is believed to be (BLE RSSI + the phone's
+    # own GPS, see nodes/phone_locator.py). phone_std_m 0 = no estimate.
+    phone_lat: float = 0.0
+    phone_lon: float = 0.0
+    phone_std_m: float = 0.0
 
 
 @dataclass
@@ -481,6 +563,22 @@ class DeliveryState(Message):
     """Everything the GCS delivery panel renders, in one message."""
 
     phase: DeliveryPhase = DeliveryPhase.IDLE
+    #: The two halves of the outcome, and the headline built from them. PENDING
+    #: until the delivery finishes; see FirebaseDeliveryNode._classify_outcome.
+    outcome: DeliveryOutcome = DeliveryOutcome.PENDING
+    return_outcome: ReturnOutcome = ReturnOutcome.PENDING
+    outcome_label: str = ""          # describe_outcome(outcome, return_outcome)
+    outcome_reason: str = ""         # why, in the operator's words
+    outcome_at: float = 0.0          # wall clock when the verdict was reached
+    #: Did the BLE drop gate pass for the order being flown? This is the ONLY
+    #: evidence of an actual handover - the payload servo is not instrumented -
+    #: so it is surfaced raw as well as folded into `outcome`.
+    ble_verified: bool = False
+    #: Metres from home when the aircraft disarmed, and the radius it was
+    #: judged against. Both shown so the operator can see a marginal call.
+    home_distance_m: float = 0.0
+    home_radius_m: float = 0.0
+    ever_armed: bool = False
     order_id: str = ""
     recipient_id: str = ""
     target_lat: float = 0.0
@@ -519,6 +617,71 @@ class DeliveryBleResult(Message):
 
     order_id: str = ""
     success: bool = False
+
+
+@dataclass
+class BlePhoneSignal(Message):
+    """What the BLE peripheral can tell about the recipient's phone.
+
+    ``kind`` is "rssi" (one received-signal-strength sample of the live
+    connection, dBm, read off the controller) or "gps" (a fix the phone wrote
+    to the GPS characteristic, HMAC-verified). ``t`` is the peripheral's
+    wall-clock time of the sample, so the navigator can pair an RSSI reading
+    with where the aircraft was when it was taken rather than when it arrived.
+    """
+
+    order_id: str = ""
+    kind: str = "rssi"
+    rssi_dbm: float = 0.0
+    lat: float = 0.0
+    lon: float = 0.0
+    t: float = 0.0
+
+
+@dataclass
+class PersonLockState(Message):
+    """The camera's person lock, for the navigator's drop-point scan.
+
+    ``state`` is TargetLock.snapshot's: search | acquire | lock | hold.
+    ``nx``/``ny`` are the locked box centre on the normalised image plane
+    (tan of the angle off the optical axis; +nx = image right, +ny = image
+    up), so the navigator can turn it into a ground offset with its own
+    altitude and camera tilt and never needs the camera's pixel geometry.
+    """
+
+    cam_id: int = 1
+    state: str = "search"
+    score: float = 0.0
+    lock_id: int = 0
+    nx: float = 0.0
+    ny: float = 0.0
+    people: int = 0
+    #: Every person in the frame this tick, [[nx, ny, score], ...], the
+    #: locked one included. The navigator scores these against the phone's
+    #: RSSI to decide WHICH person to lock when there is more than one.
+    people_xy: list = field(default_factory=list)
+
+
+@dataclass
+class PhoneHint(Message):
+    """Where the phone should appear in the camera, for picking between people.
+
+    Same normalised image plane as PersonLockState. ``sigma`` is the
+    estimate's 1-sigma radius on that plane - large when the phone is only
+    roughly known, which is what lets the lock fall back to "most confident"
+    instead of trusting a guess. ``valid`` False clears the hint. The
+    navigator only sends one when RSSI has singled out one of the people the
+    camera reported, so in practice it points at a detection.
+    """
+
+    valid: bool = False
+    nx: float = 0.0
+    ny: float = 0.0
+    sigma: float = 1.0
+    #: Drop the current lock and re-acquire on the person nearest (nx, ny).
+    #: Acted on once per ``seq``, so a latched hint cannot re-trigger it.
+    relock: bool = False
+    seq: int = 0
 
 
 # ---------------------------------------------------------------------------

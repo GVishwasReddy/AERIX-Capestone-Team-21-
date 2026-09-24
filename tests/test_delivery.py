@@ -443,6 +443,7 @@ def test_the_hardlock_stays_armed_when_auto_failsafes_are_disabled():
         nav._safety = dict(nav._safety)
         nav._safety["failsafes_enabled"] = enabled
         nav._phase = MissionPhase.NAVIGATE
+        nav._armed = True               # the ceiling is gated on armed
         over = nav._alt_ceiling + nav._alt_margin + 0.01
         nav._fused = FusedState(x=0.0, y=0.0, alt_rel_m=over, yaw=0.0, valid=True)
         assert nav._check_failsafe() == "max_altitude", (
@@ -456,6 +457,7 @@ def test_the_hardlock_brakes_rather_than_commanding_a_descent():
     sent: list = []
     bus.subscribe(Topics.MAVLINK_CMD, sent.append)
     nav._phase = MissionPhase.NAVIGATE
+    nav._armed = True                   # the ceiling is gated on armed
     nav._fused = FusedState(x=0.0, y=0.0, alt_rel_m=9.0, yaw=0.0, valid=True)
     nav.step()
     assert nav._phase == MissionPhase.HOLD

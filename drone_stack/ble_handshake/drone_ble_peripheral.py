@@ -84,6 +84,15 @@ RESULT_OK             = b"OK"
 RESULT_AUTH_FAIL      = b"AUTH_FAIL"
 RESULT_GEOFENCE_FAIL  = b"GEOFENCE_FAIL"
 RESULT_SIGNATURE_FAIL = b"SIGNATURE_FAIL"
+# The drone has not locked onto a person at the drop point yet (or the window
+# after the lock has closed). The token is NOT spent - retry the DROP.
+RESULT_NOT_READY      = b"NOT_READY"
+
+# ── Phone RSSI sampling (locating the recipient among several people) ──
+RSSI_SAMPLE_S = 0.25             # controller read period
+RSSI_POST_S = 0.5                # batch period to the GCS
+RSSI_MAX_FAILS = 12              # ~3 s of no reading = the link is gone
+RSSI_MAX_RUN_S = 20 * 60.0
 
 _HERE = Path(__file__).resolve().parent
 _RECEIPTS_PENDING_DIR = _HERE / "receipts" / "pending"
@@ -125,9 +134,9 @@ class ActiveOrder:
 
     Written by ``firebase_sync.py pull-order`` before takeoff (the "GCS
     flashes token + target coordinates into the Pi's memory" step in the
-    design doc). Loaded once at startup - a fresh delivery needs a fresh
-    process (or a restart), same as the real drone would be re-flashed
-    per-mission.
+    design doc). Loaded at startup, then replaced at runtime by _order_watch
+    whenever the GCS takes on a new order (2026-09-24; it used to need a
+    process restart per delivery, which nobody remembered to do).
     """
 
     def __init__(self, order_id: str, token: bytes, target_lat: float, target_lng: float):
@@ -191,6 +200,67 @@ def gcs_post(path: str, payload: dict) -> dict | None:
         return None
 
 
+def gcs_handshake_open() -> bool:
+    """May the parcel be released now? The navigator only opens the window
+    once the camera has locked onto a person at the drop point (see
+    NavigationNode._handshake_open). Fails CLOSED: no answer is a no."""
+    state = gcs_get("/api/state")
+    if not isinstance(state, dict):
+        return False
+    mission = state.get("mission")
+    return isinstance(mission, dict) and mission.get("handshake_open") is True
+
+
+def _post_async(payload: dict) -> None:
+    """Fire-and-forget POST, off the BLE/D-Bus event loop."""
+    threading.Thread(target=gcs_post, args=("/api/command", payload), daemon=True).start()
+
+
+class RssiSampler(threading.Thread):
+    """Reads the live connection's RSSI and posts it to the GCS in batches.
+
+    The navigator pairs each sample with where the aircraft was when it was
+    measured (hence the wall-clock timestamp) and uses them to tell WHICH of
+    the people under the drone is holding the phone."""
+
+    def __init__(self, order_id: str, device_path: str) -> None:
+        super().__init__(daemon=True)
+        self.order_id = order_id
+        self.device_path = device_path
+        self.stop_evt = threading.Event()
+
+    def run(self) -> None:
+        try:
+            from rssi_probe import RssiProbe, addr_from_device_path
+        except Exception as exc:  # noqa: BLE001
+            print(f"  ⚠️ [RSSI] probe unavailable: {exc}")
+            return
+        where = addr_from_device_path(self.device_path) or (0, None)
+        probe = RssiProbe(*where)
+        print(f"  📶 [RSSI] sampling hci{where[0]} {where[1] or '(single LE link)'}")
+        batch, fails, n = [], 0, 0
+        started = last_post = time.monotonic()
+        try:
+            while not self.stop_evt.is_set() and time.monotonic() - started < RSSI_MAX_RUN_S:
+                v = probe.read()
+                if v is None:
+                    fails += 1
+                    if fails >= RSSI_MAX_FAILS:
+                        break
+                else:
+                    fails = 0
+                    batch.append([round(time.time(), 3), v])
+                    n += 1
+                if batch and time.monotonic() - last_post >= RSSI_POST_S:
+                    gcs_post("/api/command", {"cmd": "ble_phone_signal", "params": {
+                        "order_id": self.order_id, "samples": batch}})
+                    batch, last_post = [], time.monotonic()
+                self.stop_evt.wait(RSSI_SAMPLE_S)
+        finally:
+            probe.close()
+            print(f"  📶 [RSSI] sampler stopped after {n} samples")
+
+
 def get_drone_live_gps() -> tuple[float, float] | None:
     """Ask drone_stack for the drone's own current GPS (Gate 3 needs this -
     the doc's "Pi asks the Pixhawk for the drone's OWN Live Satellite GPS").
@@ -228,6 +298,31 @@ def request_follow_me(lat: float, lon: float) -> bool:
 def gcs_set_servo(channel: int, pwm: int) -> bool:
     result = gcs_post("/api/command", {"cmd": "set_servo", "params": {"channel": channel, "pwm": pwm}})
     return bool(result and result.get("ok"))
+
+
+def gcs_payload_cfg() -> dict:
+    """Payload servo channel + lock/release PWM, asked of the GCS.
+
+    This file used to hardcode the channel (9) and both pulse widths
+    (1410/1100), which made it a THIRD copy of numbers that config/*.yaml and
+    the GCS UI already own. When the servos moved from AUX1/AUX2 to AUX5/AUX6
+    on 2026-09-06, this was the copy that would have gone on commanding the
+    dead pin - a delivery release that silently does nothing, with the receipt
+    still written and the token still burned.
+
+    GcsHub ships the whole `payload` block in every /api/state frame, so read
+    it from there. Falls back to the config defaults if the GCS is unreachable;
+    a failed lookup must not become a command on the wrong channel.
+    """
+    state = gcs_get("/api/state")
+    pl = (state or {}).get("payload") or {}
+    if not pl:
+        print("  ⚠️ [GCS] no payload config in /api/state - using defaults")
+    return {
+        "channel": int(pl.get("channel", 12)),
+        "release_us": int(pl.get("release_us", 1410)),
+        "lock_us": int(pl.get("lock_us", 1100)),
+    }
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -275,12 +370,34 @@ class DroneService(Service):
         self.last_result = RESULT_PENDING
         self._last_follow_me_ts = 0.0
         self._delivered = False         # true once this order's token is spent
+        self._rssi: RssiSampler | None = None
 
         print(f"[Pi 5] Order: {order.order_id}")
         print(f"[Pi 5] Generated initial 16-byte Nonce: {self.current_nonce.hex()}")
         print(f"[Pi 5] Order Target: ({order.target_lat}, {order.target_lng})  "
               f"micro<= {GEOFENCE_MICRO_RADIUS_M}m  "
               f"({TEMPORAL_READINGS_REQUIRED} consistent readings required)")
+
+    def swap_order(self, order: ActiveOrder, order_file: Path | None) -> None:
+        """Adopt a newly dispatched order without restarting the process.
+
+        Called on the asyncio loop (same thread as every characteristic
+        handler), so no handler can observe a half-swapped state. Any session
+        in progress was authenticated against the OLD token and is dropped:
+        the app must read a fresh nonce, exactly as after a reconnect."""
+        self.order = order
+        self.order_file = order_file
+        self.current_nonce = os.urandom(16)
+        self.is_authenticated = False
+        self.gps_verified = False
+        self.received_gps_lat = None
+        self.received_gps_lng = None
+        self.gps_readings = []
+        self.ack_hmac = bytes(20)
+        self.last_result = RESULT_PENDING
+        self._delivered = False
+        print(f"\n[ORDER] Hot-swapped to order {order.order_id} "
+              f"target ({order.target_lat}, {order.target_lng}) - token refreshed")
 
     # ──────────────────────────────────────────────────────────────
     #  1. NONCE CHARACTERISTIC (READ ONLY) — Challenge
@@ -327,6 +444,7 @@ class DroneService(Service):
             ack_payload = self.current_nonce + b"ACK"
             self.ack_hmac = hmac.new(self.order.token, ack_payload, hashlib.sha256).digest()[:20]
             print(f"  🔑 Mutual Auth ACK generated: {self.ack_hmac.hex()}")
+            self._start_rssi(options)
         else:
             self.is_authenticated = False
             self.ack_hmac = bytes(20)
@@ -379,6 +497,10 @@ class DroneService(Service):
             lng = float(parts[1])
             self.received_gps_lat = lat
             self.received_gps_lng = lng
+            # Signed, so it is the recipient's phone: let the navigator use it
+            # to find them (the RSSI search starts from here).
+            _post_async({"cmd": "ble_phone_fix", "params": {
+                "order_id": self.order.order_id, "lat": lat, "lon": lng, "t": time.time()}})
 
             # ── Anti-spoofing: don't trust a single reading ──
             self._record_temporal_reading(lat, lng)
@@ -501,11 +623,22 @@ class DroneService(Service):
             self.last_result = RESULT_SIGNATURE_FAIL
             return
 
+        # ── Gate 5: the drone must have locked onto a person below ──
+        # Checked last so a bad signature is still reported as one. Nothing
+        # is spent here: the app retries the same DROP until the navigator
+        # opens the window (or the flight gives up and returns home).
+        if not gcs_handshake_open():
+            print("  ⏳ DROP DEFERRED: no person locked at the drop point yet "
+                  "(or the window closed) - token NOT spent, retry.")
+            self.last_result = RESULT_NOT_READY
+            return
+
         print("\n" + "=" * 60)
         print("  🪂 ALL SECURITY GATES PASSED!")
         print(f"     ✅ Gate 1: HMAC Authentication   — PASSED")
         print(f"     ✅ Gate 2: Micro Geofence ({GEOFENCE_MICRO_RADIUS_M}m)  — PASSED")
         print(f"     ✅ Gate 3: Drop HMAC Signature   — PASSED")
+        print(f"     ✅ Gate 4: Person locked below   — PASSED")
         print()
         print("  🪂 TRIGGERING SERVO/SOLENOID RELEASE...")
         print("=" * 60 + "\n")
@@ -530,16 +663,39 @@ class DroneService(Service):
         # never blocks the BLE/D-Bus event loop.
         threading.Thread(target=self._release_and_finalize, daemon=True).start()
 
+    def _start_rssi(self, options) -> None:
+        """One sampler per authenticated connection."""
+        path = ""
+        try:
+            path = str((options or {}).get("device", ""))
+        except Exception:  # noqa: BLE001
+            pass
+        if self._rssi is not None and self._rssi.is_alive():
+            if self._rssi.device_path == path:
+                return
+            self._rssi.stop_evt.set()
+        self._rssi = RssiSampler(self.order.order_id, path)
+        self._rssi.start()
+
     def _release_and_finalize(self) -> None:
         """Hardware release + dual-audit receipt + token expiry.
 
         Runs on a background thread (see drop_characteristic.setter) so the
         multi-second servo settle time never blocks the BLE event loop.
         """
-        open_pwm = 1410
-        close_pwm = 1100
+        # Snapshot first: _order_watch may swap self.order for the NEXT
+        # dispatch while this thread sleeps, and the receipt + token expiry
+        # must stay with the order that was actually delivered.
+        order, order_file = self.order, self.order_file
+        lat, lng = self.received_gps_lat, self.received_gps_lng
+        # Channel and both pulse widths come from the GCS (config is the
+        # single source of truth) - never hardcoded here. See gcs_payload_cfg.
+        _cfg = gcs_payload_cfg()
+        out_ch = _cfg["channel"]
+        open_pwm = _cfg["release_us"]
+        close_pwm = _cfg["lock_us"]
 
-        if gcs_set_servo(9, open_pwm):
+        if gcs_set_servo(out_ch, open_pwm):
             print(f"[HARDWARE] Servo OPENED (PWM {open_pwm}) -> Parcel Released!")
         else:
             print("  ❌ [HARDWARE ERROR] Failed to send open command.")
@@ -547,17 +703,17 @@ class DroneService(Service):
         print("[HARDWARE] Waiting 2 seconds before resetting servo...")
         time.sleep(2)
 
-        if gcs_set_servo(9, close_pwm):
+        if gcs_set_servo(out_ch, close_pwm):
             print(f"[HARDWARE] Servo CLOSED (PWM {close_pwm}) -> Ready for next drop.")
         else:
             print("  ❌ [HARDWARE ERROR] Failed to send close/reset command.")
 
         # Dual auditing: drone-side signed receipt, queued for later upload.
-        write_drone_receipt(self.order, self.received_gps_lat, self.received_gps_lng)
+        write_drone_receipt(order, lat, lng)
 
         # Single-use token: this order's token can never be replayed.
-        if self.order_file is not None:
-            _invalidate_order_file(self.order_file)
+        if order_file is not None:
+            _invalidate_order_file(order_file)
 
         print("[STATE] Delivery complete — order token expired, ready for next flight.\n")
 
@@ -574,6 +730,88 @@ class DroneService(Service):
 #  MAIN — Start BLE Server
 # ══════════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════════
+#  ORDER HOT-RELOAD
+# ══════════════════════════════════════════════════════════════════
+#
+# The token used to be pulled ONCE, at boot (ble_handshake_start.sh). An order
+# dispatched after boot - i.e. every real flight - was then authenticated
+# against the previous order's token, and the app got AUTHENTICATION FAILED
+# with nothing to say why (2026-09-24 13:40 flight: GCS on one order, BLE on
+# the 13:38 one). Now the peripheral follows the order the GCS is flying.
+
+ORDER_WATCH_S = 3.0
+ORDER_PULL_RETRY_S = 30.0
+_DEFAULT_CRED = "/home/pi/drone_stack/config/firebase-service-account.json"
+
+
+def _gcs_order_id() -> str | None:
+    """The order the GCS currently holds, or None. Deliberately quiet (unlike
+    gcs_get): the GCS restarts often and a 3 s poll must not flood the log."""
+    try:
+        with urllib.request.urlopen(f"{GCS_BASE_URL}/api/state",
+                                    timeout=GCS_HTTP_TIMEOUT_S) as response:
+            state = json.loads(response.read().decode())
+    except (urllib.error.URLError, TimeoutError, ValueError, OSError):
+        return None
+    delivery = state.get("delivery") if isinstance(state, dict) else None
+    oid = delivery.get("order_id") if isinstance(delivery, dict) else None
+    return str(oid) if oid else None
+
+
+def _spent_order_ids(order_file: Path) -> set[str]:
+    """Every order whose token was already used for a DROP on this aircraft,
+    from the active_order.used_<ts>.json files _invalidate_order_file leaves."""
+    spent: set[str] = set()
+    for path in order_file.parent.glob(f"{order_file.stem}.used_*{order_file.suffix}"):
+        try:
+            spent.add(json.loads(path.read_text(encoding="utf-8"))["orderId"])
+        except (OSError, ValueError, KeyError):
+            continue
+    return spent
+
+
+def _pull_order_sync(cred: str, order_id: str) -> Path | None:
+    """firebase_sync.pull_order, off the event loop. Returns the file it wrote."""
+    try:
+        import firebase_sync
+        firebase_sync._init_app(cred)
+        if firebase_sync.pull_order(order_id) != 0:
+            return None
+        return firebase_sync._ACTIVE_ORDER_PATH
+    except Exception as exc:  # firebase/network errors must never kill BLE
+        print(f"  ❌ [ORDER] pull of {order_id} failed: {exc}")
+        return None
+
+
+async def _order_watch(service: "DroneService", order_file: Path, cred: str) -> None:
+    spent = _spent_order_ids(order_file)
+    failed_at: dict[str, float] = {}
+    print(f"[ORDER] Watching GCS for new orders every {ORDER_WATCH_S:.0f}s "
+          f"({len(spent)} spent order id(s) on record)")
+    while True:
+        await asyncio.sleep(ORDER_WATCH_S)
+        if service._delivered:
+            spent.add(service.order.order_id)
+        oid = await asyncio.to_thread(_gcs_order_id)
+        if not oid or oid == service.order.order_id or oid in spent:
+            continue
+        if time.monotonic() - failed_at.get(oid, -math.inf) < ORDER_PULL_RETRY_S:
+            continue
+        print(f"\n[ORDER] GCS is on order {oid}, BLE holds {service.order.order_id} "
+              f"- pulling the new token")
+        path = await asyncio.to_thread(_pull_order_sync, cred, oid)
+        try:
+            new = ActiveOrder.load(path) if path is not None else None
+        except (OSError, ValueError, KeyError) as exc:
+            print(f"  ❌ [ORDER] pulled file unreadable: {exc}")
+            new = None
+        if new is None or new.order_id != oid:
+            failed_at[oid] = time.monotonic()
+            continue
+        service.swap_order(new, path)
+
+
 def _parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Drone BLE handshake peripheral")
     parser.add_argument(
@@ -587,6 +825,11 @@ def _parse_args(argv=None):
         help="refuse an active_order.json older than this many seconds "
              "(0 disables the check). A deliveryToken is single-use and issued "
              "per flight, so a stale file means guaranteed HMAC failures.",
+    )
+    parser.add_argument(
+        "--cred", default=os.environ.get("AERIX_FIREBASE_CRED", _DEFAULT_CRED),
+        help="Firebase service-account JSON used to pull a newly dispatched "
+             "order's token at runtime (see _order_watch)",
     )
     parser.add_argument(
         "--dev", action="store_true",
@@ -683,6 +926,15 @@ async def main():
           "+ Signed Payloads + RESULT read-back")
     print(" Status          : Advertising... Waiting for Mobile App connection.")
     print("=" * 60 + "\n")
+
+    # Held in a local: asyncio keeps only weak refs to tasks, so an unreferenced
+    # watcher could be garbage-collected mid-flight.
+    watch = None
+    if Path(args.cred).exists():
+        watch = asyncio.create_task(_order_watch(service, args.order_file, args.cred))
+    else:
+        print(f"  ⚠️  [ORDER] no Firebase credentials at {args.cred} - order hot-reload "
+              "OFF; a newly dispatched order needs: sudo systemctl restart aerix-ble")
 
     await asyncio.Event().wait()
 

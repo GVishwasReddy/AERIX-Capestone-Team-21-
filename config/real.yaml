@@ -52,6 +52,35 @@ lidar:
   fov_enabled: true
   fov_deg: 250.0
 
+  # Noise rejection. Both stages were sized from a measurement on THIS aircraft
+  # (bench, 2026-09-21, 202 revolutions at 10.1 Hz) - see default.yaml for the
+  # survival table and drone_stack/interfaces/lidar_interface.py for the
+  # reasoning. Values match default.yaml today; they are repeated here because
+  # this is the profile the aircraft actually flies, and CLAUDE.md 11's warning
+  # about default/real drift applies.
+  #
+  # If the radar looks sparser than you expect, check `filtered_out` in the
+  # lidar diagnostics before suspecting the sensor - that is this filter
+  # reporting its own work.
+  quality_min: 4
+  filter_enabled: true
+  filter_depth: 3
+  filter_min_support: 2
+  filter_angular_tol_bins: 3
+  filter_range_tol_m: 0.30
+  filter_fast_approach: true
+  # Poll 2.5x faster than the C1 revolves (2026-09-23). The driver only hands
+  # over COMPLETED revolutions, so this does not invent scans - it collects
+  # each one as soon as it lands instead of up to a whole 100 ms tick late.
+  # The C1's own rate (~10 Hz, ~5 kSa/s) is deliberately NOT raised: at a
+  # fixed sample rate a faster spin spreads the same samples over more
+  # revolutions, so a thin pole gets FEWER points per scan - worse, not
+  # better, for exactly the far-and-thin case this change exists for.
+  rate_hz: 25
+  # A gap with no completed revolution longer than this is reported as a
+  # WARN "empty scan"; shorter ones are just polls between revolutions.
+  empty_warn_s: 0.5
+
 # Obstacle avoidance for MANUAL flight. The Pi streams the 270 deg scan to
 # the Pixhawk as OBSTACLE_DISTANCE and ArduPilot limits the pilot's own stick
 # demand - the aircraft simply will not fly closer than AVOID_MARGIN. Yaw is
@@ -91,6 +120,20 @@ proximity:
 # tell that the cluster 2 m ahead is the one that was 3 m ahead a moment ago -
 # which is why avoidance only ever reacted to stationary things.
 obstacles:
+  # Matches lidar.rate_hz; the node processes each revolution once, as soon as
+  # it arrives (it skips polls that find no new scan).
+  rate_hz: 25
+  # Range-aware size gate (2026-09-23): the point count a cluster needs shrinks
+  # with range to what an object this wide fills at 1 deg per bin (3 points
+  # close in, down to 1 point far out). 0.10 m covers a sign post / thin pole.
+  min_object_width_m: 0.10
+  # Revolutions a sparse (< min_points) cluster must be tracked before it is
+  # published - about 0.3 s. Dense clusters publish on first sight as before.
+  sparse_min_hits: 3
+  # A confirmed obstacle missing from one revolution keeps being published,
+  # predicted forward, for this long (~max_misses revolutions) - so a dropped
+  # return does not flip the avoider SLOW -> CLEAR -> SLOW.
+  coast_s: 0.35
   tracking:
     enabled: true
     # Association radius. At 10 Hz this also caps the fastest apparent motion
@@ -142,7 +185,12 @@ safety:
   # Standard operating ceiling for delivery test flights. Every commanded
   # altitude is clamped to this by NavigationNode._clamp_alt; the hardlock
   # brakes only on an UNcommanded climb past this + altitude_margin_m.
-  max_altitude_m: 3.0
+  # 5.0 (2026-09-24 pm, operator: "5 m ceiling for all, incl. hover");
+  # 4.0 earlier that day, 2.0 before, 3.0 before 2026-08-30.
+  # Every commanded altitude is clamped to this by _clamp_alt, so
+  # takeoff/cruise/hover below must all sit at or under it or they are
+  # silently trimmed instead of flown. Hardlock = this + altitude_margin_m.
+  max_altitude_m: 5.0
 
 delivery:
   enabled: true
@@ -152,14 +200,27 @@ delivery:
   auto_accept: false
   upload_to_fc: true
   write_back: true
-  # Ceiling for the drop-point hold. Extended from 5.0 -> 23.0 -> 30.0
-  # (2026-08-27) to give drone_ble_peripheral.py's handshake+geofence+drop
-  # exchange with the recipient's phone time to complete before the hard
-  # timeout RTL. If the handshake finishes earlier, NavigationNode cuts the
-  # hold short instead of waiting out the full 30s - see
-  # ble_early_rtl_enabled/_wait_s below.
-  hover_seconds: 30.0
-  hover_altitude_m: 3.0
+  # How close to home the aircraft must end up for the delivery to count as
+  # RETURNED. This is half of the outcome the GCS reports: the parcel's story
+  # (delivered / not delivered / aborted) and the aircraft's (returned / did
+  # not return) are independent, and a delivery that succeeded while the
+  # aircraft put itself down in a field is not a clean flight. Generous enough
+  # to cover GPS scatter and a landing a few metres off the pad.
+  home_radius_m: 15.0
+  # HARD ceiling for the drop-point hold - this is the "handshake FAILED" timer.
+  # 30.0 -> 20.0 (2026-09-19, operator request). If drone_ble_peripheral.py's
+  # handshake+geofence+drop exchange with the recipient's phone has not
+  # completed by now the parcel is not going to be released, and hanging over a
+  # customer for another 10 s buys nothing but battery. At the timeout the
+  # aircraft runs exactly the same about-face + RTL + LAND as a success, so the
+  # two outcomes differ only in how long they waited.
+  #
+  # The SUCCESS path does not wait this out - see ble_early_rtl_wait_s.
+  hover_seconds: 20.0
+  # 2.0 -> 4.0 -> 5.0 (2026-09-24). NOTE this is not only the hold altitude:
+  # FirebaseDeliveryNode builds the drop waypoint AND the takeoff from it,
+  # so it is the altitude of the whole delivery leg.
+  hover_altitude_m: 5.0
   # GUIDED, never POSHOLD/LOITER. Those take their ALTITUDE from the pilot's
   # throttle stick, which sits at RC3_MIN through an autonomous delivery -
   # ArduPilot reads that as "descend at the full pilot rate". Flights on
@@ -181,13 +242,77 @@ delivery:
   # outbound path, so it can cross ground the aircraft has not already flown -
   # but it crosses it with avoidance live, which SMART_RTL cannot.
   return_mode: RTL
+  # SUCCESS path: how long to keep holding AFTER the BLE handshake confirms the
+  # drop, before the about-face + RTL. 3.0 -> 2.0 (2026-09-19, operator
+  # request). Deliberately NOT zero: the release servo needs time to finish its
+  # travel and the parcel needs time to actually leave the aircraft before it
+  # starts yawing. Overrides the 3.0 in default.yaml.
+  ble_early_rtl_wait_s: 2.0
+
+  # --- drop-point person scan + phone locator (2026-09-24) ------------------
+  # Operator requirement: over the drop point hold 5 m (was: come down to 3 m;
+  # 2026-09-24 pm the operator asked for NO descent - scan at the leg altitude;
+  # the VisDrone detector also scored 0.50 at 4 m vs 0.23-0.30 at 3 m) with the camera
+  # DOWN and search for a person (small orbit, in case the recipient is just
+  # outside the frame). Only once a person is LOCKED may the BLE handshake
+  # release the parcel; DROP before that answers NOT_READY and keeps the
+  # token. No person in person_search_s -> RTL with avoidance. Locked but no
+  # handshake in handshake_window_s -> RTL. Handshake -> RTL as before.
+  #
+  # With two or more people in view, the RSSI of the phone's live BLE link,
+  # sampled from every point of the orbit, is scored against each person's
+  # ground position to tell which one holds the phone. It is only trusted at
+  # locator_pick_prob; below that the camera's pick stands (the HMAC handshake
+  # is what authenticates the recipient - this only decides where to wait).
+  person_scan_enabled: true
+  scan_altitude_m: 5.0
+  person_search_s: 25.0
+  handshake_window_s: 25.0
+  scan_orbit_radius_m: 2.0
+  scan_orbit_points: 8
+  scan_orbit_step_s: 3.0
+  scan_descend_timeout_s: 8.0
+  scan_obstacle_hold_m: 3.0   # skip an orbit point this close to an obstacle
+  scan_max_total_s: 90.0
+  # Someone in view mid-orbit: stop THERE and hold for the lock, rather than
+  # flying on and carrying them out of the frame (operator, 2026-09-24).
+  scan_pause_on_person: true
+  scan_pause_conf: 0.30       # plain detection score worth stopping for (HEF floor 0.20)
+  scan_pause_max_s: 6.0       # stopped this long with no lock -> move on for another angle
+  scan_resume_s: 1.5          # person out of view this long -> resume the orbit
+  scan_found_grace_s: 3.0     # stopped on someone at the 25 s mark -> this much extra for the lock
+  locator_enabled: true
+  locator_pick_prob: 0.8
+  locator_log_dir: logs/rssi  # every RSSI sample + aircraft pose, for tuning
+
+  # --- arrival + landing (2026-09-19) --------------------------------------
+  # How close to home, horizontally, counts as "over the pad" and hands the
+  # aircraft from RTL to LAND.
+  #
+  # Much tighter than home_radius_m (15.0), and they are not the same idea:
+  # home_radius_m is a REPORTING threshold deciding whether the flight counted
+  # as returned, sized for GPS scatter. This one decides where the aircraft
+  # physically puts itself down, so it is sized to the ground station.
+  land_radius_m: 2.0
+  # Do not arm the arrival test the instant RTL is commanded. For the first
+  # second or two of RTL the aircraft is still sitting over the drop point, and
+  # on a short test flight - or a bench run where the drop point is a few
+  # metres from the pad - it would satisfy land_radius_m immediately and land
+  # on the customer instead of coming home.
+  land_arm_delay_s: 5.0
+  # Ceiling on the whole return leg. If RTL has not brought the aircraft inside
+  # land_radius_m by now, land where it is rather than orbit until the battery
+  # failsafe takes it. At cruise_speed_ms 1.0 this is ~120 m of travel, well
+  # outside any delivery this airframe flies.
+  land_rtl_timeout_s: 120.0
 
 navigation:
-  # 3 m standard profile: climb to 3 m, hold 2 s, run the leg, hold at the
-  # drop point, SMART_RTL home. Kept at/below safety.max_altitude_m so
-  # _clamp_alt is a no-op on these rather than silently trimming them.
-  takeoff_altitude_m: 3.0
-  cruise_altitude_m: 3.0
+  # 5 m standard profile (2 m until 2026-09-24, then 4 m): climb to 5 m, hold 2 s,
+  # run the leg, hold at the drop point, RTL home. Kept at/below
+  # safety.max_altitude_m so _clamp_alt is a no-op on these rather than
+  # silently trimming them.
+  takeoff_altitude_m: 5.0
+  cruise_altitude_m: 5.0
   takeoff_settle_s: 2.0
   # Acceptance radius: how close counts as "reached". Tightened 1.5 -> 1.0
   # for small test areas. This is a PRECISION requirement, not a distance
@@ -206,6 +331,19 @@ navigation:
   # leg adds the dynamic-obstacle tracking ArduPilot's static obstacle database
   # handles poorly.
   avoidance_enabled: true
+  # Takeoff gate (2026-09-23). Avoidance is STANDBY - shown on the panel, never
+  # acted on - until the aircraft has climbed above this, then latches ACTIVE
+  # until disarm. Lifting off, the LiDAR plane sweeps the legs, the operator
+  # and whatever the aircraft launched beside; braking or steering off those
+  # mid-climb fights the takeoff. Below 0.95 x takeoff_altitude_m so a normal
+  # mission always hands over before NAVIGATE; latched so in-flight dips
+  # (logged to ~1.5 m) cannot switch it back off.
+  avoidance_min_alt_m: 1.5
+  # When the cruise band finds no flyable gap, decelerate at this rate so the
+  # aircraft reaches the brake distance nearly stopped instead of at cruise
+  # speed (0.4 m/s^2: 1.0 m/s -> 0 over 1.25 m, so at cruise the slow-down
+  # starts ~3.75 m out). Only used when there is no flyable gap.
+  avoidance_trapped_decel_ms2: 0.4
   # Reactive sector dodge (see default.yaml). Side cones are clamped to
   # lidar.fov_deg/2 = 125 deg, so they cover exactly the scanned window and
   # nothing is ever read as "clear" out of the masked rear 90 deg. With the
@@ -218,12 +356,23 @@ navigation:
   # a Tarot 650: the frame is ~0.33 m in radius, so 1 m of LiDAR range is
   # roughly 0.65 m of clear air past the prop tips. Set to match AVOID_MARGIN
   # on the FC, which is what actually stops the aircraft in manual flight.
-  # HARD BRAKE. Last resort, not the normal way obstacles are dealt with: the
-  # FC's path planner is configured to route around things from ~10 m out with
-  # avoidance_route_margin_m of clearance, so in normal flight this should
-  # never fire. If it is firing regularly, the routing is not working and that
-  # is the thing to fix - not this number.
-  avoidance_stop_m: 1.7
+  # CRITICAL DISTANCE. Hard stop, then search for a new route. Last resort, not
+  # the normal way obstacles are dealt with: the cruise band above it
+  # (avoidance_distance_m) bends the course from 11.5 m out, so in normal flight
+  # this should never fire. If it is firing regularly the steering is not
+  # solving and THAT is the thing to fix - not this number.
+  #
+  # 1.7 -> 1.5 on 2026-09-21, and it is now honoured exactly against a
+  # stationary obstacle. It was not before: stop_distance_for padded it by
+  # closing_ms * avoidance_reaction_s, and closing_ms is body-frame range rate
+  # which INCLUDES our own forward motion. Flying at a fence post at
+  # cruise_speed_ms (1.0) made the hard brake fire at 2.70 m against a
+  # configured 1.70 - the operator asked for one distance and got another,
+  # and the cruise band lost the bottom metre of its runway to a brake it
+  # could not see coming. The pad now keys off the tracker's ego-compensated
+  # is_dynamic/speed_m_s instead, so a mover still buys its reaction margin
+  # and a wall does not.
+  avoidance_stop_m: 1.5
   # Clearance the FC's path planner (OA_MARGIN_MAX) keeps while routing in
   # GUIDED/RTL. Deliberately well outside the hard brake so the two never
   # collide: the route bends around an obstacle long before the aircraft is
@@ -234,10 +383,79 @@ navigation:
   # BendyRuler more likely to report "no path" in tight spaces. If the test
   # area has gaps narrower than ~2x this, lower it.
   avoidance_route_margin_m: 3.0
-  # Where the Pi starts easing off the throttle. Raised 3.0 -> 5.0 so the
-  # aircraft is already slowing while the planner is bending, which gives the
-  # route more time to develop and keeps the deviation small.
-  avoidance_distance_m: 5.0
+
+  # -- who routes, and when -------------------------------------------------
+  # Added 2026-09-21 for "make sure avoidance works in rtl also".
+  #
+  # The return leg used to have a hard brake and no steering: the Pi watches
+  # and stops at avoidance_stop_m but deliberately does not steer in RTL (the
+  # FC discards position setpoints there), and the FC could not steer either
+  # because OA_TYPE measured 0 - BendyRuler has never run on this airframe.
+  #
+  # ArduPilot has no per-mode OA switch, so leaving OA_TYPE=1 permanently
+  # would put BendyRuler and this node's cruise band on one aircraft. Instead
+  # ownership is handed over explicitly: OA_TYPE=0 at link-up while the Pi
+  # flies, and avoidance_rtl_oa_type on the way into the return.
+  #
+  # ⚠️ REQUIRES A ONE-TIME OPERATOR STEP. OA_TYPE instantiates its backend at
+  # BOOT, so the FC must be booted once with OA_TYPE=1 before this handoff can
+  # enable anything - until then the OA_BR_* parameters do not even exist.
+  # See /tmp/oa_enable.py on the Pi. Without that step the handoff is inert
+  # and the aircraft behaves exactly as it did before: Pi routes NAVIGATE,
+  # brake-only in RTL.
+  # WHO FLIES THE RETURN. "pi" | "fc".
+  #
+  # "pi" flies the return as an ordinary waypoint at home, so the cruise band,
+  # the authority floor, the slew limiter, nose-track, the clear hold-off and
+  # the 1.5 m critical brake are the SAME code coming home as going out -
+  # covered by the same measurements and the same tests. This is the only
+  # avoidance on this aircraft that has ever been measured working.
+  #
+  # "fc" hands the return to the flight controller, which needs OA_TYPE=1 and
+  # a reboot to steer at all, and BendyRuler has never run here. Dijkstra
+  # (OA_TYPE 2) is NOT an upgrade: it plans against fence polygons only, and
+  # FENCE_ENABLE measured 0 with none defined, so it cannot see a LiDAR
+  # return. BendyRuler is the only FC-side planner this sensor can feed.
+  #
+  # Offered ONLY on the three job-finished paths. A low-battery or geofence
+  # failsafe, and any operator-pressed RTL, still go straight to the FC.
+  avoidance_rtl_router: pi
+  # How long the Pi may own the return before handing it back to the FC. A
+  # steerer that cannot solve its way home must not keep trying at a 2 m
+  # ceiling until the battery failsafe decides for it.
+  avoidance_rtl_pi_budget_s: 240.0
+
+  avoidance_rtl_oa_handoff: true
+  # 1 = BendyRuler. The only planner this aircraft's 2D LiDAR can feed.
+  avoidance_rtl_oa_type: 1
+  # Where the Pi starts BENDING THE COURSE (not slowing - see _steer_step).
+  # Raised 5.0 -> 8.0 on 2026-09-19, then 8.0 -> 10.0 on 2026-09-21 ("avoid
+  # from long distance only").
+  #
+  # This is the outer edge of the steering band, and it sets how gentle the
+  # whole manoeuvre is: at cruise_speed_ms (1.0) this is ~11 seconds of runway
+  # in which to develop a course change, so the aircraft leans away from an
+  # obstacle at a few degrees per second instead of arriving at the brake
+  # distance with the entire turn still to do. Against the 1.5 m critical
+  # distance the band is 10 m wide - and note the band, not this number
+  # alone, is what steer_authority ramps across.
+  #
+  # 10.0 -> 11.5 on 2026-09-23 ("start avoiding at the LiDAR's full range").
+  #
+  # The old comment here justified 10 m with "0.72 deg/sample, ~5 samples on a
+  # 0.5 m pole at 8 m" - but the driver bins to 1 deg (360 bins, nearest per
+  # bin), so that pole is 3 bins, and a 0.3 m pole is only 3 bins inside
+  # ~5.7 m. With a fixed obstacles.min_points of 3 the band was 10 m on paper
+  # and ~2-4 m in practice for thin objects: logged poles were in the scan at
+  # 4-5 m and first published at ~2.2 m. The fix is upstream (range-aware
+  # obstacles.min_object_width_m + sparse_min_hits + coast_s), which is what
+  # makes a band this wide mean something. Single-return noise is held off by
+  # the quality gate, ScanFilter's 2-of-3 vote AND sparse_min_hits, not by
+  # shrinking the band.
+  #
+  # 0.5 m below lidar.max_range_m (12.0) so the band is entered by returns the
+  # tracker has already had a few revolutions to confirm.
+  avoidance_distance_m: 11.5
   avoidance_front_half_deg: 50.0
   avoidance_side_half_deg: 125.0
   # Pi-side reactive sidestep OFF (2026-08-30). Routing is now the flight
@@ -253,8 +471,139 @@ navigation:
   # planner should never have let us reach.
   #
   # Set true to get the Pi sidestep back (it still works, and is tested).
-  avoidance_dodge_enabled: false
-  avoidance_dodge_speed_ms: 1.0
+  # STILL OFF (2026-08-30) - deliberately, and the flag below says so.
+  #
+  # What changed today is the QUALITY of what this flag would turn on, not the
+  # decision to turn it on. The Pi-side reactive layer now steers with VFH+ -
+  # a polar histogram over the whole scanned window, obstacles widened by the
+  # room the airframe needs, and the course set to the best surviving GAP -
+  # instead of the front/left/right sidestep this was switched off for. That
+  # removes the "the Pi is simply a worse router than BendyRuler" objection.
+  #
+  # It does NOT remove the objection below, which is the one that matters.
+  # Enabling this is a flight-safety decision to be taken together with OA_TYPE
+  # on the FC, and it has not been taken. See docs/30auglidarintegration.md
+  # section 8b for the two valid combinations.
+  #
+  # ⚠️  READ BEFORE FLYING: the note this replaces turned the dodge off because
+  #     "two things steering at once is worse than one" - the Pi's velocity
+  #     setpoint REPLACES the guided target ArduPilot's BendyRuler is flying.
+  #     That is still true. Pick ONE router: either leave OA_TYPE=0 on the FC
+  #     and let this steer, or set OA_TYPE=1 (BendyRuler) and turn this back
+  #     off. Both live at once is the configuration that tears up the route
+  #     mid-manoeuvre.
+  #
+  #     OA_TYPE=1, NOT 2. BendyRuler is the only path planner that consults the
+  #     proximity database this stack feeds with OBSTACLE_DISTANCE. OA_TYPE=2
+  #     is Dijkstra, which plans against fence polygons ONLY and ignores
+  #     proximity sensors completely - setting it would look like avoidance was
+  #     enabled while the LiDAR contributed nothing to routing at all.
+  avoidance_dodge_enabled: true
+
+  # VFH+ steering. Values are the ones flown in Drone-Autonomy-ROS2.
+  # The histogram spans only lidar.fov_deg, so the masked rear has no bins and
+  # can never be selected as free - there is still no reverse escape.
+  avoidance_vfh_enabled: true
+  avoidance_vfh_sector_deg: 5.0
+  # MUST stay comfortably larger than the brake distance in force, or the
+  # steerer aims its whole manoeuvre INSIDE the band the brake calls an
+  # emergency, and no amount of steering authority can save the approach.
+  # That invariant was violated until 2026-09-19: this was 1.0 (inherited
+  # from Drone-Autonomy-ROS2, never reconciled with this band) while
+  # avoidance_stop_m is 1.7 and the closing-speed pad takes the brake to
+  # 2.70 m at cruise. VFH+ therefore steered to miss a pole by 1.0 m,
+  # declared that a success, and flew into the brake - measured closest
+  # approach 1.66 m, then a dead stop that never recovered.
+  #
+  # Swept closed-loop at 10 Hz against a 0.3 m pole on this exact band
+  # (cruise 1.0 m/s, band 8.0 -> 2.70 m):
+  #     radius  miss   braked  max lateral
+  #       1.0   1.70   YES        1.31
+  #       1.5   1.49   YES        1.57
+  #       2.0   1.86   no         1.97   <- only 0.16 m of margin
+  #       2.5   2.10   no         2.25   <- flown
+  #       3.0   2.36   no         2.54
+  #       3.5   2.63   no         2.86
+  # 2.5 is the least conservative value with real margin (0.40 m over the
+  # 1.70 m nominal stand-off; the aircraft is abeam and barely closing by
+  # then, so 1.70 rather than 2.70 is the number that applies). Going
+  # bigger is not free: angular enlargement is asin(radius/distance), so a
+  # larger radius blocks more of the histogram, fewer valleys clear
+  # avoidance_vfh_min_valley_deg, and choose_heading starts returning None
+  # in gaps that are actually flyable - which hands control straight back
+  # to the brake. Raise it to 3.0 for more clearance in open ground; do not
+  # raise it to buy margin in tight ground, where it does the opposite.
+  avoidance_vfh_safety_radius_m: 2.5
+  avoidance_vfh_min_valley_deg: 18.0
+  avoidance_vfh_goal_weight: 1.0
+  avoidance_vfh_hysteresis_weight: 0.8
+  avoidance_vfh_max_heading_rate_deg_s: 25.0
+  # Obstacles beyond this do not enter the histogram at all. It must sit
+  # OUTSIDE avoidance_distance_m or an obstacle would become SLOW-relevant
+  # before VFH+ could see it to steer around, which reads as the aircraft
+  # noticing something and doing nothing. 10.0 -> 11.0 -> 12.0 (2026-09-23,
+  # with the band at 11.5): the whole LiDAR range. It must not exceed
+  # lidar.max_range_m - nothing arrives from beyond it (pinned by
+  # test_every_shipped_profile_satisfies_the_clearance_invariant).
+  avoidance_vfh_range_m: 12.0
+  # ---- cruise-band steering (2026-09-19) ---------------------------------
+  # Slew limit for the cruise-band nudge. Deliberately well under
+  # avoidance_vfh_max_heading_rate_deg_s (45): that rate is for the emergency
+  # dodge, which has metres to work with and must take them.
+  #
+  # 15.0 -> 10.0 on 2026-09-21. 15 was not chosen for smoothness, it was the
+  # rate the OLD 6.3 m band needed - and the acceptance run measured the slew
+  # pinned at the 15 deg/s cap for the whole manoeuvre, which is the signature
+  # of a turn that started late, not one that started gently. The band is now
+  # 8.5 m = 8.5 s of runway, in which 10 deg/s is 85 deg of available turn
+  # against the ~30 deg the geometry actually asks for. Smoothness is a
+  # property of RATE (see steer_authority), so this is the knob that owns it.
+  avoidance_steer_rate_deg_s: 10.0
+  # Authority at the OUTER edge of the band. steer_authority's ease-out curve
+  # is exactly 0.0 at the band edge, so before this the aircraft arrived at
+  # avoidance_distance_m commanding no deflection and spent the first second
+  # playing catch-up against the rate limiter. At 10 m, 0.25 authority on a
+  # ~20 deg gap is 5 deg of lean - ~9 cm/s of lateral travel, i.e. nothing if
+  # the cluster is a single-return artefact, and a full second of head start
+  # if it is real.
+  avoidance_steer_authority_floor: 0.25
+  # Speed held while bending. 0.0 = use navigation.cruise_speed_ms.
+  #
+  # Keep it at cruise. The reported fault was the aircraft stopping in front
+  # of obstacles, and the correction belongs on the COURSE, not the speed:
+  # slowing down while steering lengthens the time spent alongside the
+  # obstacle without adding any clearance. The hard brake at
+  # avoidance_stop_m is still there for the case this band fails to solve.
+  avoidance_steer_speed_ms: 0.0
+  # ---- nose-on-waypoint (2026-09-21) -------------------------------------
+  # Hold the nose on the active waypoint at ALL times, including right through
+  # an avoidance manoeuvre.
+  #
+  # Until now the stack never commanded yaw at all: velocity setpoints go out
+  # in MAV_FRAME_BODY_NED with the yaw bit masked off, so ArduPilot STRAFES and
+  # the nose stayed wherever the last nav command left it. avoidance_yaw_before
+  # _move only guarantees the waypoint is inside avoidance_yaw_release_deg (60)
+  # before translating - it does not hold it there.
+  #
+  # The safety argument, beyond an aircraft that looks where it is going: the
+  # LiDAR window is 250 deg front-referenced, so the 110 deg it CANNOT see is
+  # always directly behind the nose. Pinning the nose to the waypoint puts the
+  # dense middle of the scan on the path being flown, and because _steer_step
+  # and _dodge_step both clamp vx >= 0, every commanded translation is then
+  # within +/-90 deg of the nose - inside the scanned window by a 35 deg
+  # margin. The masked rear becomes unreachable by construction.
+  avoidance_nose_track: true
+  # Drift allowed before the nose is re-commanded. Not a precision target:
+  # CONDITION_YAW settles with overshoot and the attitude estimate has its own
+  # noise, so a tighter deadband just issues turns that cancel. 8 deg is well
+  # inside avoidance_front_half_deg (50).
+  avoidance_nose_deadband_deg: 8.0
+  # Pacing on the re-command. CONDITION_YAW is a DISCRETE command - re-sending
+  # it restarts the turn, so at the 10 Hz loop rate it would never land. This
+  # is the same trap already documented on the pre-RTL turn, and the same 2 s
+  # answers it.
+  avoidance_nose_recommand_s: 2.0
+  avoidance_dodge_speed_ms: 0.5
   avoidance_dodge_clear_m: 2.5
   avoidance_dodge_timeout_s: 5.0
   # Forward speed carried while sidestepping. Fades in only as the front sector
@@ -273,6 +622,97 @@ navigation:
   # (capped by avoidance_reaction_max_m), so something walking into the path at
   # 1.5 m/s triggers the brake at 3.2 m rather than 1.7 m and ends up with the
   # same real margin as a wall.
+  # Hysteresis on releasing the avoidance brake. The obstacle must open up to
+  # avoidance_stop_m + this before the hold is handed back to the mission.
+  # Without it, scan jitter around the stop distance flips BRAKE against a
+  # GUIDED goto at the 10 Hz loop rate.
+  avoidance_release_m: 0.4
+
+  # ---- look before you go -------------------------------------------------
+  # The LiDAR window is 250 deg front-referenced, so the rear 110 deg is never
+  # scanned. Those sectors go to the FC as 65535 = unknown, and ArduPilot's
+  # proximity database reads unknown as CLEAR - so BendyRuler would happily
+  # route into ground the LiDAR has never seen. The aircraft also cannot
+  # reverse out of the rear (that is the point of the mask), and at a 2 m
+  # ceiling it cannot climb over.
+  #
+  # So a waypoint whose bearing lands in the masked rear is not flown at: the
+  # aircraft holds station and yaws until its nose - and therefore the dense
+  # middle of the scan window - is on the path, then proceeds normally under
+  # the usual avoidance. Engages beyond +/-125 deg, releases inside 60 deg;
+  # the wide hysteresis stops it oscillating on its own threshold.
+  #
+  # NOTE this only gates gotos THIS node issues. The RTL leg is flown by the
+  # FC, where the equivalent lever is WP_YAW_BEHAVIOR (set to 1 = face next
+  # waypoint, RTL included - it was 2, which excluded RTL and flew the whole
+  # way home without ever turning).
+  avoidance_yaw_before_move: true
+  avoidance_yaw_release_deg: 60.0
+  # Slow on purpose: at 25 deg/s a 180 deg turn takes ~7 s, which is ~7 full
+  # LiDAR revolutions across the sweep - the scan actually resolves what is
+  # back there instead of smearing through it.
+  avoidance_yaw_rate_deg_s: 25.0
+  # On timeout it HOLDS and shouts; it does not give up and fly blind.
+  avoidance_yaw_timeout_s: 20.0
+  # Face home before handing over to the FC's RTL. The lever above only gates
+  # gotos THIS node issues; the return leg is flown by the flight controller,
+  # where the equivalent is WP_YAW_BEHAVIOR - a parameter this node cannot
+  # read. So the aircraft turns onto home first, and the return leg's scan
+  # coverage stops depending on a setting nobody can see from here.
+  #
+  # Only the three "job finished" returns do this (handshake outside the hold,
+  # waypoints exhausted, hover complete). A battery/geofence failsafe RTL and
+  # the three operator-pressed returns still go home immediately.
+  #
+  # Engages on the same criterion as the waypoint gate - home beyond
+  # +/-125 deg, i.e. in the masked rear - so on a normal delivery that ends
+  # roughly pointed homeward it does nothing at all.
+  avoidance_yaw_before_rtl: true
+  # Short on purpose. A 180 deg turn at 25 deg/s is ~7 s, so this is "should
+  # have finished by now". It also bounds how long the GCS-side failsafes are
+  # suppressed: the phase is already RTL while turning, and _check_failsafe
+  # deliberately does not fight an in-progress RTL. On timeout it RETURNS
+  # ANYWAY and logs an ERROR - it never holds, because refusing to start an
+  # RTL keeps the aircraft up burning battery.
+  avoidance_rtl_yaw_timeout_s: 8.0
+  # STAGE 1 of the pre-RTL turn, and the one that always runs: a full 180 deg
+  # about-face the moment a delivery finishes, before the bearing test above is
+  # even asked.
+  #
+  # Unconditional on purpose. The aircraft flew in forwards and finishes nose-on
+  # to the customer, so "turn around" and "point back down the inbound track"
+  # are the same instruction - and doing it every time means the behaviour is
+  # identical every flight instead of depending on a bearing nobody watched. It
+  # also sweeps the LiDAR's masked rear 110 deg through the airspace the return
+  # leg is about to fly into, before anything moves into it.
+  #
+  # Completion is MEASURED off the attitude estimate, not timed: a timed turn
+  # would report success against a yaw controller that never moved.
+  avoidance_rtl_about_face: true
+  # How short of a true 180 counts as turned. Demanding an exact 180 from a yaw
+  # controller that settles with overshoot would just burn the budget every
+  # flight. Inside avoidance_yaw_release_deg (60) so a completed about-face
+  # never leaves stage 2 with work to do.
+  avoidance_rtl_about_face_tol_deg: 15.0
+  # ONE ceiling over BOTH turn stages, not one each - this IS the window in
+  # which the GCS-side failsafes (battery, link, geofence) stay suppressed, and
+  # suppression does not care which stage is spending it. Letting the two time
+  # out independently would stack to 16 s, and 8 s is the documented survivable
+  # figure above.
+  #
+  # 12 s is a floor, not a preference: 180 deg at avoidance_yaw_rate_deg_s
+  # (25 deg/s) is 7.2 s of unavoidable turning plus handover margin. Raise
+  # avoidance_yaw_rate_deg_s to shrink it. The FC's own battery failsafe is
+  # unaffected throughout.
+  avoidance_rtl_yaw_total_s: 12.0
+  # Ceiling on how long the Pi may hold an FC-flown return braked against an
+  # obstacle before handing the return back, whatever the LiDAR still says.
+  #
+  # The brake has to be a moment, not a state: while it holds, the aircraft is
+  # not coming home, and a Pi seizing a mode the FC is flying is the 2026-08-22
+  # lockout in miniature. 10 s is long enough for somebody to walk out of the
+  # path and short enough that one false return cannot strand the aircraft.
+  avoidance_rtl_brake_max_s: 10.0
   avoidance_reaction_s: 1.0
   avoidance_reaction_max_m: 2.0
 
@@ -280,3 +720,229 @@ navigation:
 # (saves CPU when no one is watching the live preview).
 cameras:
   enabled: true
+
+  # JPEG quality for the MJPEG stream (1-100). 60 is the point where the
+  # camera's own sensor noise costs more bandwidth than the extra quality buys.
+  jpeg_quality: 60
+
+  # ------------------------------------------------------------------ picam --
+  picam:
+    # Sized to the link, and the link changed. The original 640x360@10 was set
+    # when the Pi rode a 2.4 GHz extender that measured only ~2.2 Mbit/s
+    # end-to-end - 1280x720 q60 produced 23 Mbit/s there and delivered ~1.9 of
+    # 30 fps, so the picture looked frozen. Re-measured 2026-09-13: the same
+    # SSID now negotiates a 130 Mbit/s PHY and carries 13.4 Mbit/s end-to-end,
+    # about 6x the old figure. 720p30 fits with headroom for MAVLink and
+    # telemetry PROVIDED jpeg_quality stays moderate - see the note below.
+    # Re-run scripts/camera_latency.py after any change here: it separates
+    # encode rate (the Pi) from delivered rate (the link).
+    width: 1280
+    height: 720
+    fps: 30
+    isp_denoise: fast
+    # Auto-exposure bias: normal | short | long | custom. "short" trades gain
+    # for a shorter exposure. On a moving aircraft this cuts motion blur AND the
+    # rolling-shutter skew that makes the frame appear to tear horizontally,
+    # because the top and bottom rows are sampled closer together in time.
+    #
+    # 2026-09-23: "short" still lets the shutter reach 5-20 ms before it spends
+    # gain, and at 6-15 Hz airframe vibration a 10 ms exposure smears the whole
+    # picture. "custom" writes the table below into the sensor tuning's AGC:
+    # AGC raises the shutter to shutter_us[i], then the gain to gain[i], stage
+    # by stage - so this holds the shutter at <= 3 ms up to 4x gain and only
+    # goes long in genuinely dark scenes. Costs some noise, which the ISP
+    # denoise above handles. An invalid table falls back to "short" (logged).
+    ae_mode: custom
+    ae_custom:
+      shutter_us: [100, 1500, 3000, 5000, 10000, 30000]
+      gain:       [1.0, 2.0,  4.0,  6.0,  8.0,   16.0]
+    # Lens position in dioptres (1 / focus distance in m); unset = libcamera's
+    # default of 1.0 = focused at 1 m, which on this lens is sharp only from
+    # ~0.7 to ~1.8 m - the ground at flight altitude was soft. 0.45 is about
+    # the hyperfocal setting: ~1.1 m to infinity in focus. Fixed on purpose,
+    # not autofocus: AF hunting in flight breathes the picture.
+    lens_position: 0.45
+    # Apply the CPU frame filter below to this camera. On by default: this is
+    # the camera whose CSI ribbon runs past the ESCs.
+    filter: true
+    # 720p30 is 30 frames/s to push. At 13.4 Mbit/s the whole stream must stay
+    # under roughly 8 Mbit/s to leave the link room, which is ~33 KB a frame.
+    # Measured on this scene; raise only if camera_latency.py shows the
+    # delivered rate still matching the encode rate.
+    jpeg_quality: 55
+
+    # -- adaptive bitrate --
+    # The link is not reliably 13 Mbit/s. It is 13 Mbit/s on the bench and
+    # something much worse behind a building, at range, or with the airframe's
+    # own body between the antennas. A fixed quality cannot survive that: the
+    # MJPEG endpoint always sends the NEWEST frame and drops the rest, so a
+    # link that cannot carry 8 Mbit/s does not give you late video, it gives
+    # you 6 fps of stuttering video.
+    #
+    # So the encoder is steered by what viewers actually RECEIVE. Frame rate is
+    # held and sharpness is spent to hold it, because a soft 30 fps picture is
+    # flyable and a sharp 6 fps one is not.
+    adaptive: true
+    adapt_target_fps: 30
+    # [scale, jpeg_quality], sharpest first. Quality is spent before resolution
+    # because JPEG quality degrades gracefully (softer) while resolution
+    # degrades structurally (you stop being able to see the parcel site).
+    # Approximate bitrates measured on this scene at 30 fps:
+    adapt_ladder:
+      - [1.00, 55]   # ~8.1 Mbit/s - 720p, bench link
+      - [1.00, 44]   # ~5.9 Mbit/s
+      - [1.00, 34]   # ~4.2 Mbit/s
+      - [1.00, 26]   # ~3.1 Mbit/s - still 720p, visibly soft
+      - [1.00, 20]   # est. ~2.5 Mbit/s (not yet measured) - last rung, still 720p
+    # Hard floor on the published height, whatever the ladder says. The
+    # sub-720p rungs (960x540, 640x360) were removed on 2026-09-15 at the
+    # operator's request; this also guards against one being re-added.
+    min_height: 720
+    # Camera is mounted upside down - see config/default.yaml.
+    rotate_180: true
+    # Full-resolution record stream (second ISP output, YUV420). Recorded in
+    # flight as JPEG + a motion index, rendered after landing to a stabilised
+    # 1920x1080 replay. Remove both keys to record the live stream instead.
+    record_width: 2304
+    record_height: 1296
+
+  # --------------------------------------------------------------- stabilize --
+  # Digital stabilisation of the live stream (drone_stack/gcs/stabilizer.py).
+  # The ISP delivers capture_width x capture_height; the published 1280x720 is
+  # warped out of it, so the difference (128x72 px each side, 8.3%) is how far
+  # the correction can move the picture. Vibration above smooth_hz is removed,
+  # slower motion (pans, climbs) is kept.
+  #
+  # rs_bands (2026-09-23): the rolling-shutter "jello" unbend. The motion fit
+  # gains a translation that varies smoothly down the frame (rs_bands nodes),
+  # which both stops a rigid fit jumping between row strips (the old estimator
+  # added jitter of its own) and yields a per-row shear that straightens the
+  # wobble. rs_hp_hz leaks the accumulated bend so measurement noise cannot
+  # random-walk into a permanent skew. 0 = off (rigid fit, as before).
+  # Motion blur still cannot be fixed here - see ae_mode above.
+  stabilize:
+    enabled: true
+    mode: similarity          # similarity (x, y, roll) | translate (x, y only, cheaper)
+    capture_width: 1536
+    capture_height: 864
+    smooth_hz: 2.0
+    max_angle_deg: 2.5
+    rs_bands: 12
+    rs_hp_hz: 0.5
+    rs_per_band: 16
+
+  # ------------------------------------------------------------- person_lock --
+  # Single-target person lock on the Hailo-8 (drone_stack/gcs/person_lock.py).
+  # The HEF runs ~16-18 inferences/s; the box is carried at the full 30 fps by
+  # a Kalman tracker between detections.
+  person_lock:
+    enabled: true
+    # MODEL CHOICE (2026-09-21). models/visdronebest.hef (yolo26s_visdrone_best)
+    # is UNUSABLE as compiled: its head ends in ONE concat23 output carrying box
+    # coords (pixels, 0-646) AND the class score (0-1) under a SINGLE uint8
+    # quantisation scale (measured: scale=2.5352, zero_point=0, quant_infos=1).
+    # Half a step is 1.27, so every score <= 1.0 quantises to 0 - measured raw
+    # uint8 score channel nonzero=0 of 8400 anchors, on real frames AND flat
+    # grey. The scores are destroyed ON-CHIP; no host decode can recover them.
+    # Fix is to recompile it with the NMS post-process op (as yolov8n.hef has),
+    # or with the score branch on its own output so it gets its own scale.
+    # yolov8n.hef carries on-chip NMS (1 class = person, thr 0.2, IoU 0.7) and
+    # was verified against aeroscapes aerial imagery with known person masks:
+    # scores 0.77/0.75/0.71/0.65 on drone-viewpoint frames.
+    # UPDATE: the "UNUSABLE" note above describes the OLD single-concat export.
+    # The visdronebest.hef on the aircraft now loads as a split 6-head model
+    # (log 2026-09-24: "visdronebest.hef on Hailo-8 (input 640x640, 6-head)"),
+    # so scores keep their own quantisation and it is the model in use.
+    hef: models/visdronebest.hef
+    # acquire_conf 0.40 -> 0.30 (2026-09-24, A/B on 394 labelled aerial people,
+    # scripts in ~/avoid_verify/pl_ab.py): this model's MEDIAN true-person
+    # score is 0.42, so 0.40 rejected ~59% of real frames and 2-in-a-row
+    # succeeded ~17% -> the flickering lock of the 13:40 flight. At 0.30:
+    # recall 0.58/frame, 0.04 false boxes/frame (FP twice in a row ~0.2%).
+    # yolov8n (R@0.3 0.42, FP 0.19) and 2-tile inference (no gain, 2x FP)
+    # both lost to visdronebest full-frame; do not switch without re-running.
+    acquire_conf: 0.30        # a NEW lock needs this score, seen twice in a row
+    keep_conf: 0.20           # an EXISTING lock is kept down to this (occlusion)
+    confirm_hits: 2
+    # STICKINESS (2026-09-21). The operator requirement is that once the lock
+    # is on a person it does not leave them, so these are deliberately long.
+    # hold_s/exit_s only buy time INSIDE one lock; the real work is done by
+    # the re-acquisition memory below, which survives a full reset().
+    hold_s: 4.0               # coast this long through missed detections
+    exit_s: 1.5               # drop once the box has left the frame this long
+    nms_iou: 0.5
+    # After a lock is lost the target is remembered for reacquire_s; a
+    # detection matching that memory re-locks the SAME person immediately,
+    # ahead of the generic 'most confident wins' acquire. reacquire_dist is
+    # the search radius, as a multiple of the remembered box height.
+    # Set reacquire_s: 0 to disable and get the old behaviour back.
+    reacquire_s: 8.0
+    reacquire_dist: 3.0
+    # Horizontal FOV of the RAW frame (Pi Cam v3 standard lens ~66 deg). Puts
+    # the lock and every detection on the normalised image plane the
+    # navigator projects to the ground for the drop-point scan.
+    hfov_deg: 66.0
+
+  # ----------------------------------------------------------------- filter --
+  # CPU image conditioning. Deliberately narrow: it fixes what the ISP cannot
+  # see, which is row-correlated interference from the ESCs coupling into the
+  # CSI ribbon in flight (horizontal lines drifting through the frame).
+  # See drone_stack/gcs/frame_filter.py for the full rationale.
+  filter:
+    enabled: true
+
+    # -- stage 1: destripe (~1 ms at 720p) --
+    destripe: true
+    # Rows compared against a median of this many neighbours. The window wants
+    # to sit at or above the interference period but BELOW the finest real
+    # horizontal texture worth keeping. Measured at 720p: 21 removes 81% of a
+    # continuous band (15 removes 34%) while keeping the horizon at 100% and
+    # real horizontal texture at 97%; 31 removes only 69% and destroys half of
+    # that texture. Note that banding slower than the window is indistinguishable
+    # from vertical shading and is deliberately left alone.
+    destripe_window: 21
+    # Shrinkage floor in DN. A row within this much of where its neighbours say
+    # it belongs is left bit-for-bit alone, so a clean frame passes through
+    # untouched and nothing is ever invented. Raise if fine horizontal detail
+    # looks softened; lower to catch fainter banding.
+    destripe_floor: 0.6
+    # Largest correction any single row may receive, in DN. A residual bigger
+    # than this is more likely a real edge the median could not follow exactly
+    # than interference - the rows either side of a hard horizon are where that
+    # happens. Measured on a banded scene with an 89 DN horizon: capping at 10
+    # keeps 90% of the horizon against 85% uncapped while removing slightly MORE
+    # of the band. Raise only if you genuinely have banding stronger than this.
+    destripe_ceiling: 10.0
+    destripe_gain: 1.0
+    # Sample every Nth column when measuring row brightness. 4 is 4x cheaper
+    # and statistically identical - a 720p row still contributes 320 samples.
+    column_step: 4
+
+    # -- stage 2: row repair --
+    # A row displaced this far (DN) is destroyed rather than merely offset, so
+    # it is redrawn from the nearest surviving rows instead of being corrected.
+    row_repair: true
+    row_repair_floor: 14.0
+
+    # -- stage 3: temporal denoise (~8 ms at 720p on a Mac; measured and
+    #    auto-disabled on hardware if it does not fit - see budget_ms) --
+    temporal: true
+    # Blend weight against the previous frame where nothing moved. Higher is
+    # cleaner but slower to respond; 0.95 is the hard ceiling.
+    temporal_alpha: 0.6
+    # Frame-to-frame change (DN) at or below which motion is indistinguishable
+    # from sensor noise - blend at full strength. Without this deadband the
+    # noise floor sits partway up the ramp and halves the filter for nothing.
+    temporal_deadband: 6.0
+    # Change (DN) at which the blend drops to zero, so genuine movement passes
+    # through untouched and never ghosts or smears.
+    temporal_motion: 20.0
+    # Motion gate evaluated on s x s blocks. Bigger is cheaper and less
+    # noise-sensitive, but localises motion less precisely.
+    temporal_gate_scale: 4
+
+    # Latency guard. If the smoothed per-frame filter cost stays above this,
+    # the temporal stage is dropped (and the reason logged) rather than letting
+    # the video fall behind. Destriping is never dropped: it is the stage the
+    # artefact actually needs and it costs almost nothing.
+    budget_ms: 22.0

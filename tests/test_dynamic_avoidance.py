@@ -201,21 +201,70 @@ def test_a_long_gap_restarts_rather_than_differentiating_across_it():
 
 
 # -- closing-speed-aware braking ---------------------------------------------
+def _pad_cfg():
+    return _cfg(navigation={"avoidance_stop_m": 1.7, "avoidance_reaction_s": 1.0,
+                            "avoidance_reaction_max_m": 2.0})
+
+
 def test_stop_distance_grows_with_closing_speed():
-    avoider = CollisionAvoider(
-        _cfg(navigation={"avoidance_stop_m": 1.7, "avoidance_reaction_s": 1.0,
-                         "avoidance_reaction_max_m": 2.0})
-    )
-    assert math.isclose(avoider.stop_distance_for(0.0), 1.7)
-    assert math.isclose(avoider.stop_distance_for(1.5), 3.2)
+    """The pad is keyed off the obstacle's OWN approach rate (2026-09-21).
+
+    It used to be keyed off closing_ms alone, which is body-frame range rate
+    and therefore includes our own forward motion - so flying at a wall
+    inflated the brake exactly as much as a wall flying at us. See
+    stop_distance_for. The margin a mover buys is unchanged; what changed is
+    that a static obstacle no longer buys it on our behalf.
+    """
+    avoider = CollisionAvoider(_pad_cfg())
+    assert math.isclose(
+        avoider.stop_distance_for(0.0, own_speed_ms=0.0, is_dynamic=False), 1.7)
+    assert math.isclose(
+        avoider.stop_distance_for(1.5, own_speed_ms=1.5, is_dynamic=True), 3.2)
 
 
 def test_stop_distance_is_capped():
-    avoider = CollisionAvoider(
-        _cfg(navigation={"avoidance_stop_m": 1.7, "avoidance_reaction_s": 1.0,
-                         "avoidance_reaction_max_m": 2.0})
-    )
-    assert math.isclose(avoider.stop_distance_for(50.0), 3.7)
+    avoider = CollisionAvoider(_pad_cfg())
+    assert math.isclose(
+        avoider.stop_distance_for(50.0, own_speed_ms=50.0, is_dynamic=True), 3.7)
+
+
+def test_our_own_cruise_does_not_inflate_the_critical_distance():
+    """avoidance_stop_m is the number the operator set. Honour it exactly.
+
+    This is the whole point of the 2026-09-21 change. Flying at a stationary
+    fence post at cruise_speed_ms (1.0) makes closing_ms 1.0, and the old pad
+    turned a configured 1.7 m hard brake into a 2.70 m one - so the operator
+    asked for one critical distance and the aircraft used another, and the
+    cruise band silently lost the bottom metre of its runway.
+    """
+    avoider = CollisionAvoider(_pad_cfg())
+    for our_speed in (0.5, 1.0, 2.0, 5.0):
+        assert math.isclose(
+            avoider.stop_distance_for(our_speed, own_speed_ms=0.0,
+                                      is_dynamic=False), 1.7), \
+            "our own %.1f m/s inflated the critical distance" % our_speed
+
+
+def test_a_receding_mover_does_not_pad_the_brake():
+    """speed_m_s is a MAGNITUDE - it cannot tell toward from away on its own.
+
+    The pre-2026-09-21 code got this right via max(0.0, closing_ms), and the
+    first cut of the ego-compensated version regressed it: a person walking
+    AWAY at 1.5 m/s was padded to 3.0 m and hard-braked at 1.6 m. Both terms
+    are needed - closing_ms for direction, speed_m_s for ownership.
+    """
+    avoider = CollisionAvoider(_pad_cfg())
+    assert math.isclose(
+        avoider.stop_distance_for(-0.5, own_speed_ms=1.5, is_dynamic=True), 1.7)
+
+
+def test_a_crossing_mover_barely_pads_the_brake():
+    """Something moving fast but not at us closes the gap slowly, so the pad
+    tracks the closing rate rather than the object's speed."""
+    avoider = CollisionAvoider(_pad_cfg())
+    # 3 m/s across the path, only 0.2 m/s of that along the line of sight.
+    assert math.isclose(
+        avoider.stop_distance_for(0.2, own_speed_ms=3.0, is_dynamic=True), 1.9)
 
 
 def test_receding_never_shrinks_the_configured_standoff():
@@ -236,6 +285,11 @@ def test_a_fast_approach_brakes_before_a_nearer_static_object():
     wall = _at(3.0, 0.0)                     # nearer, but static -> only SLOW
     walker = _at(3.5, 0.0)                   # further, but closing at 2 m/s
     walker.closing_ms = 2.0                  # its stop distance becomes 3.7 m
+    # is_dynamic/speed_m_s are what the tracker publishes for a person walking
+    # in at 2 m/s, and since 2026-09-21 they are what the pad keys off - the
+    # raw closing rate cannot distinguish them from our own cruise.
+    walker.is_dynamic = True
+    walker.speed_m_s = 2.0
     decision, nearest = avoider.evaluate(ObstacleArray(obstacles=[wall, walker]))
     assert decision == "stop"
     # The verdict came from the further object; `nearest` still reports the

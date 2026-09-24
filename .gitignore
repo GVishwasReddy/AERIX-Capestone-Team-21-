@@ -21,6 +21,7 @@ gstshark_*/
 
 # large binary model weights - not source, swapped via config/novelty/models.yaml
 models/*.hef
+person_detect/*.hef
 
 # runtime logs
 hailort.log
@@ -29,6 +30,7 @@ pyhailort.log
 # ad-hoc backup copies left alongside edited files
 *.bak_*
 *.bak.*
+*.bak-*
 
 # Firebase service-account private key: full project access, never commit it.
 config/firebase-service-account.json
@@ -40,6 +42,9 @@ config/pending_order.json
 *.claude-bak
 *.prof-bak
 *.3m-profile-*
+*.predeploy_*
+*.preyaw_*
+*.bw_*
 .backup_delivery/
 backup-*/
 
@@ -50,3 +55,13 @@ backup-*/
 # customer GPS coordinates. Never commit.
 drone_stack/ble_handshake/active_order*.json
 drone_stack/ble_handshake/receipts/
+
+# flight video: the recorder keeps one clip plus its poster and
+# metadata here. Hundreds of MB of footage, and not source.
+recordings/
+
+# local tooling: the graphify knowledge graph of this repo, rsync scratch,
+# and one-off stderr captures
+graphify-out/
+.synctmp/
+err.txt

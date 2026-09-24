@@ -340,6 +340,10 @@ before these changes.)
 - [x] FC params set and read back; FC rebooted
 - [x] Tests — 249 passing
 - [x] Ground verification on the Pi
+- [x] VFH+ gap steering — histogram, valley selection, slew limit (§8b)
+- [x] VFH+ forward component clamped at zero — no reverse into the masked rear
+- [x] VFH+ course wired into the avoidance panel's predicted escape route
+- [ ] **Decide the router** — FC `OA_TYPE=1` *or* Pi VFH+, never both (§8b)
 - [ ] **Flight test** — nothing here has been flown
 
 ### Still open
@@ -397,7 +401,7 @@ lookahead was raised rather than lowered to keep the deviation "minimum".
 Kept at 10 rather than 12 so the planner is not reasoning about space at the
 very edge of what the sensor reliably returns.
 
-### Pi-side reactive dodge switched OFF
+### Pi-side reactive dodge switched OFF *(superseded — see §8b)*
 
 `avoidance_dodge_enabled: false`. Routing is the FC's job now, and two things
 steering at once is worse than one: the Pi's dodge commands a velocity
@@ -412,6 +416,90 @@ remains and is still tested; it is one flag to bring back.
 6 m of gap to fly between two obstacles. In a tight test area it may report "no
 path" and stop rather than squeeze through. If that happens, lower
 `avoidance_route_margin_m` — it is a config change, no reboot.
+
+---
+
+## 8b. VFH+ gap steering on the Pi
+
+The reasoning above is unchanged: **two routers steering at once is worse than
+one**, because the Pi's velocity setpoint *replaces* the guided target the FC
+is flying. What changed is that the Pi's reactive layer is no longer a strictly
+worse router than BendyRuler, so which one to pick is now a real choice rather
+than a foregone one.
+
+### What was wrong with the three-cone dodge
+
+It collapsed a 250° scan into three numbers — front, left, right — and asked
+"left or right?". At that resolution a doorway and a solid wall with a dent in
+it are the same reading, so the answer was always "commit to a whole side".
+
+### What replaced it
+
+VFH+ (Ulrich & Borenstein), the approach `Drone-Autonomy-ROS2`'
+`mission_avoidance_node` flies. It keeps the angular detail:
+
+| Step | What happens | Knob |
+|---|---|---|
+| **Bin** | The scanned window is cut into 5° bins — 50 of them across ±125° | `avoidance_vfh_sector_deg` |
+| **Enlarge** | Each return blocks its own width **plus** `asin(safety_radius / distance)`, so the same object seals a wider arc the closer it gets | `avoidance_vfh_safety_radius_m` |
+| **Gate** | Gaps narrower than the airframe needs are discarded as unflyable | `avoidance_vfh_min_valley_deg` |
+| **Choose** | The surviving gap whose centre is nearest the waypoint wins, with a pull toward the course already being flown so it commits instead of dithering | `avoidance_vfh_goal_weight`, `avoidance_vfh_hysteresis_weight` |
+| **Slew** | The commanded course ramps rather than steps | `avoidance_vfh_max_heading_rate_deg_s` |
+
+Only returns inside `avoidance_vfh_range_m` (10 m) vote, so distant clutter
+does not make the histogram twitch.
+
+### The rear stays unmeasured, structurally
+
+The histogram spans **only** `lidar.fov_deg`. The masked rear 110° has no bins
+at all, so a bearing back there cannot be *found* free — "nothing behind us"
+stays the absence of data rather than the absence of obstacles. Valleys are
+never wrapped around the circle either; joining the two mask edges would invent
+a corridor straight through the blind side.
+
+Two consequences follow, and both are pinned by tests:
+
+* **No flyable gap ⇒ brake, never reverse.** `choose_heading` returns `None`
+  and the aircraft holds. The source node reverses out of a dead end here; this
+  airframe cannot, and the altitude ceiling rules out climbing over.
+* **A rear-quadrant course is a lateral slide, not a back-up.** The chosen
+  bearing may legitimately reach ±116° (the window minus half a valley) when
+  the waypoint is behind the wing — an overshooting dodge, or the whole RTL
+  leg. The forward component is `dodge_speed × cos(heading)`, which is
+  *negative* there, so it is **clamped at zero**. Without that clamp the stack
+  commanded −0.44 m/s straight into the 110° it cannot see, and reported it on
+  the panel as "fwd -0.4 m/s".
+
+### Forward speed is still earned
+
+Unchanged from the sidestep: while the front is inside the brake distance,
+forward speed is zero and the manoeuvre is pure lateral motion; it fades in
+only as the sidestep opens the front up. VFH+ is additionally capped by its own
+`cos(heading)` component, so switching routers can never command *more* speed
+at an obstacle than the three-cone dodge would. All the extra freedom is
+lateral.
+
+### ⚠️ Pick exactly one router before flying
+
+| Choice | FC | Pi |
+|---|---|---|
+| **FC routes** | `OA_TYPE=1` (BendyRuler) | `avoidance_dodge_enabled: false` |
+| **Pi routes** | `OA_TYPE=0` (planner off) | `avoidance_dodge_enabled: true`, `avoidance_vfh_enabled: true` |
+
+`OA_TYPE=1`, **not 2**. BendyRuler is the only path planner that consults the
+proximity database this stack feeds with `OBSTACLE_DISTANCE`. `OA_TYPE=2` is
+Dijkstra, which plans against fence polygons *only* and ignores proximity
+sensors completely — setting it would look like avoidance was enabled while the
+LiDAR contributed nothing to routing at all.
+
+Both live at once is the configuration that tears up the route mid-manoeuvre.
+
+**Current state:** `config/real.yaml` ships with `avoidance_dodge_enabled:
+false` and `avoidance_vfh_enabled: false` — the FC routes, exactly as §8a left
+it. `config/default.yaml` has VFH+ on, which is what the tests and SITL run
+against. Turning it on for the real aircraft is a deliberate flight-safety
+decision that has to be made together with `OA_TYPE`; it is listed as an open
+work item above and has not been taken.
 
 ---
 
@@ -539,6 +627,15 @@ already stops a distant cluster stealing a track from one sitting on top of it.
   FC parameters set and rebooted, 249 tests passing, live verification clean.
   Found and fixed false dynamic detections (loose gate + smoothed-velocity
   gating). Not yet flown.
+- **30 Aug** — Pi-side reactive layer reworked from the three-cone dodge to
+  VFH+ gap steering (§8b). Finished off: the forward component is clamped at
+  zero so a rear-quadrant course can no longer command reverse thrust into the
+  masked rear; the latched side now follows the re-solved course instead of the
+  one picked at entry; braking into AVOID clears the carried course; and the
+  avoidance panel predicts with whichever router is actually enabled. Six
+  regression tests added, each verified to fail against the previous code.
+  Config left as the FC routing — enabling VFH+ on the aircraft is still an
+  open decision. Not yet flown.
 
 ---
 
@@ -548,13 +645,20 @@ already stops a distant cluster stealing a track from one sitting on top of it.
    that `PRX_FILT=2.0` has not made it twitchy. This is the one change that
    could re-introduce the old oscillation, and it is trivial to back out
    (`PRX_FILT 0.5`).
-2. **Then GUIDED, one short leg, no payload.** `OA_TYPE=1` is new behaviour: the
+2. **Confirm only one router is live.** `OA_TYPE` on the FC and
+   `navigation.avoidance_dodge_enabled` on the Pi must not both be on — see
+   the table in §8b. As shipped the FC routes and the Pi does not.
+3. **Then GUIDED, one short leg, no payload.** `OA_TYPE=1` is new behaviour: the
    aircraft will now **re-aim itself** around obstacles, which it has never done
    before. Expect yaw changes — that constraint applied to manual flight only.
-3. **Keep a hand on the mode switch.** The transmitter-authority rule is intact:
+4. **Keep a hand on the mode switch.** The transmitter-authority rule is intact:
    the navigator stands down the instant the switch moves.
-4. Watch `off-track` on the avoidance panel. If dodges are hitting the 4 m cap
+5. Watch `off-track` on the avoidance panel. If dodges are hitting the 4 m cap
    often, the cap or `avoidance_dodge_clear_m` needs retuning.
+6. If VFH+ is ever enabled on the aircraft, watch the panel's steering readout
+   for a course that parks at ±116° — that is the aircraft asking to go
+   somewhere it cannot see, and it should be sliding sideways at zero forward
+   speed, not creeping backwards.
 
 Backout: `~/drone_stack/backup-20260830-avoidance/` holds every file replaced,
 and `scripts/set_avoidance_params.py` documents every original FC value.

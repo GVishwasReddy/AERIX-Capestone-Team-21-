@@ -49,8 +49,14 @@ def _nav():
 
 
 def _above_ceiling(nav):
-    """Put the aircraft where the hardlock will trip, as it did on the day."""
+    """Put the aircraft where the hardlock will trip, as it did on the day.
+
+    Armed, because on the day it was flying. The hardlock is gated on _armed:
+    relative_alt only re-zeros when the FC arms, so on the ground it reports
+    whatever the barometer has drifted to and the ceiling is meaningless.
+    """
     nav._phase = MissionPhase.NAVIGATE
+    nav._armed = True
     nav._fused = FusedState(x=0.0, y=0.0, alt_rel_m=9.0, yaw=0.0, valid=True)
 
 
@@ -121,13 +127,21 @@ def test_battery_critical_outranks_the_altitude_hardlock():
     assert nav._check_failsafe() == "battery_critical"
 
 
-def test_a_disarmed_bench_aircraft_does_not_trip_the_battery_failsafe():
-    """0 V on the bench (no pack connected) is not a critical battery."""
+def test_a_disarmed_bench_aircraft_trips_nothing():
+    """A bench aircraft trips NEITHER failsafe.
+
+    0 V (no pack connected) is not a critical battery, and a barometer that has
+    drifted since the datum was set is not a climb. Both checks are gated on
+    _armed for the same reason: neither input means anything until the FC has
+    armed. Sitting on the ground the Pi read 5.08 m against a 2.0 m ceiling and
+    logged the hardlock 1637 times in three minutes, burying every other error
+    in the journal.
+    """
     bus, nav = _nav()
     _above_ceiling(nav)
     nav._armed = False
     nav._battery = Battery(voltage_v=0.0, remaining_pct=0.0)
-    assert nav._check_failsafe() == "max_altitude"
+    assert nav._check_failsafe() is None
 
 
 # -- transmitter authority ---------------------------------------------------
@@ -367,3 +381,25 @@ def test_starting_a_mission_still_works_once_control_is_handed_back():
     result = services.call("start_mission")
     assert result.success, result.message
     assert nav._start_requested is True
+
+
+def test_the_hardlock_still_fires_the_moment_it_is_armed():
+    """The gate must not become an off switch: arm it and the ceiling is live
+    again, whatever the failsafes_enabled bench switch says."""
+    bus, nav = _nav()
+    _above_ceiling(nav)
+    assert nav._check_failsafe() == "max_altitude"
+
+
+def test_the_hardlock_logs_once_per_breach_not_once_per_tick(caplog):
+    """The brake keeps being applied at loop rate; only the log is limited. An
+    ERROR repeated ten times a second is how a real fault goes unnoticed."""
+    import logging
+    bus, nav = _nav()
+    _above_ceiling(nav)
+    with caplog.at_level(logging.ERROR, logger="drone.navigation"):
+        for _ in range(30):
+            nav.step()
+    hardlock = [r for r in caplog.records if "ALTITUDE HARDLOCK" in r.getMessage()]
+    assert len(hardlock) == 1, f"{len(hardlock)} hardlock ERRORs in 30 ticks"
+    assert nav._phase == MissionPhase.HOLD, "but it must still be braking"

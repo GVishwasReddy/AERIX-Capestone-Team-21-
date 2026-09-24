@@ -16,10 +16,14 @@ def test_registry_builds_from_config_without_hardware(valid_config_dir):
     assert registry.names() == ["terrain", "yolov8n"]
 
 
-def test_registry_models_degrade_gracefully_without_hailo(valid_config_dir):
-    """hef paths in the fixture config don't exist on disk (repo-relative,
-    dev machine) - both adapters must report ok=False, never raise."""
-    cfg = NoveltyConfig.load(valid_config_dir)
+def test_registry_models_degrade_gracefully_without_hailo(missing_hef_config_dir):
+    """With no weights on disk, both adapters report ok=False and never raise.
+
+    Uses ``missing_hef_config_dir``, not ``valid_config_dir``: the latter's
+    repo-relative hef paths are real files on the Pi, so this asserted the
+    machine rather than the contract.
+    """
+    cfg = NoveltyConfig.load(missing_hef_config_dir)
     registry = ModelRegistry.from_config(cfg.models)
 
     for name in registry.names():
@@ -54,10 +58,16 @@ def test_registry_get_unknown_name_raises_key_error(valid_config_dir):
         raise AssertionError("expected KeyError")
 
 
-def test_registry_infer_on_degraded_model_returns_empty_output(valid_config_dir):
+def test_registry_infer_on_degraded_model_returns_empty_output(missing_hef_config_dir):
+    """A degraded model still answers - with an empty result, not an exception.
+
+    This is the property the whole camera tap leans on: inference is called on
+    every kept frame, and a missing or busy Hailo must cost an empty output,
+    never a raise into the frame loop.
+    """
     import numpy as np
 
-    cfg = NoveltyConfig.load(valid_config_dir)
+    cfg = NoveltyConfig.load(missing_hef_config_dir)
     registry = ModelRegistry.from_config(cfg.models)
 
     detector_out = registry.get("yolov8n").infer(np.zeros((640, 640, 3), dtype=np.uint8))
@@ -100,6 +110,11 @@ def test_registry_builds_multiclass_adapter_from_class_map_spec(tmp_path):
     models["models"]["terrain"]["class_map"] = [
         "grass", "pavement", "dirt", "water", "vegetation", "obstacle", "unknown",
     ]
+    # Point at weights that cannot exist, so the degradation half of this test
+    # holds on the Pi too (which ships real models/*.hef). See
+    # conftest.missing_hef_config_dir.
+    for name, spec in models["models"].items():
+        spec["hef_path"] = str(tmp_path / "no_such_dir" / f"{name}.hef")
     write_config_dir(tmp_path, overrides={"models.yaml": models})
 
     cfg = NoveltyConfig.load(tmp_path)
@@ -107,7 +122,7 @@ def test_registry_builds_multiclass_adapter_from_class_map_spec(tmp_path):
 
     terrain = registry.get("terrain")
     assert isinstance(terrain, MultiClassSegmenterAdapter)
-    assert terrain.ok is False  # hef doesn't exist at this repo-relative path here
+    assert terrain.ok is False  # no weights on disk, on any machine
 
     out = terrain.infer(np.zeros((384, 640, 3), dtype=np.uint8))
     assert out.kind == "terrain"

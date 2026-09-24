@@ -31,7 +31,10 @@ def test_hub_payload_and_commands(monkeypatch):
         assert payload["scan"] and len(payload["scan"]["ranges"]) == 360
         assert payload["avoidance"] is not None
         assert isinstance(payload["obstacles"], list)
-        assert len(payload["cameras"]) == 2
+        # One camera since the USB C270 was removed 2026-09-11; the Pi
+        # camera keeps id 1, and cameras[] is keyed by position.
+        assert len(payload["cameras"]) == 1
+        assert payload["cameras"][0]["id"] == 1
         assert "cpu" in payload["health"]
 
         # NL command via hub

@@ -12,10 +12,16 @@ Automatically reconnects if the device is unplugged.
 from __future__ import annotations
 
 import math
+import time
+from dataclasses import replace
 
 from drone_stack.bus import MessageBus
 from drone_stack.bus.topics import Topics
-from drone_stack.interfaces.lidar_interface import FovMask, LidarInterface
+from drone_stack.interfaces.lidar_interface import (
+    FovMask,
+    LidarInterface,
+    ScanFilter,
+)
 from drone_stack.msg import Diagnostic, DiagLevel, LaserScan, PointCloud, ScanState
 from drone_stack.srv import ServiceRegistry, ServiceRequest, ServiceResponse
 from drone_stack.utils.config import Config
@@ -47,8 +53,26 @@ class LidarNode(NodeBase):
         # Reported to the GCS so the radar can draw the front line and the
         # ignored rear wedge from the same numbers the driver masks with.
         self.fov = FovMask(section)
+        # Temporal persistence gate. Applied HERE rather than in the driver so
+        # the simulator inherits exactly the same one - CLAUDE.md 11b is the
+        # standing lesson about a sim that agrees with itself and not with the
+        # aircraft - and so that every consumer downstream (PointCloud, the GCS
+        # radar, ObstacleNode -> NavigationNode, and ProximityNode -> FC) reads
+        # one filtered view instead of each re-deriving its own.
+        #
+        # Until 2026-09-21 only ProximityNode filtered, and only for itself.
+        # That was defensible while the FC did the avoiding; since CLAUDE.md 12
+        # the Pi owns the cruise band and the return leg, so the branch feeding
+        # NavigationNode was the unfiltered one that actually moves the aircraft.
+        self.filter = ScanFilter(section)
         self._scan_count = 0
         self._empty_reads = 0
+        # This node polls faster than the C1 revolves (CLAUDE.md 13c) so a
+        # revolution is picked up the moment it completes, not up to a whole
+        # tick later. Most polls therefore find nothing new - that is normal,
+        # not a fault. Only a genuine gap longer than ``empty_warn_s`` warns.
+        self._empty_warn_s = float(section.get("empty_warn_s", 0.5))
+        self._last_scan_t = time.monotonic()
         self._scan_state = ScanState.SCANNING
         self.services.register("scan_start", self._svc_start)
         self.services.register("scan_stop", self._svc_stop)
@@ -74,6 +98,16 @@ class LidarNode(NodeBase):
         return ServiceResponse(True, "scan resumed")
 
     def on_start(self) -> None:
+        f = self.filter
+        if f.enabled:
+            self.log.info(
+                "scan filter: %d of last %d revolutions must corroborate, "
+                "+/-%d bins, +/-%.2f m%s",
+                f.min_support, f.depth, f.angular_tol, f.range_tol,
+                ", fast-approach on" if f.fast_approach else "",
+            )
+        else:
+            self.log.warning("scan filter DISABLED - raw scans on /scan")
         self._ensure_connected()
 
     def _ensure_connected(self) -> bool:
@@ -109,11 +143,13 @@ class LidarNode(NodeBase):
             if not self.iface.connected:
                 self._publish_diag(DiagLevel.ERROR, "LiDAR link lost - reconnecting")
                 self._ensure_connected()
-            else:
+            elif time.monotonic() - self._last_scan_t > self._empty_warn_s:
                 self._publish_diag(DiagLevel.WARN, "empty scan")
             return
 
+        self._last_scan_t = time.monotonic()
         self._scan_count += 1
+        scan = self._filtered(scan)
         self.publish(Topics.SCAN, scan)
         self.publish(Topics.CLOUD, self._to_cloud(scan))
         valid = sum(1 for r in scan.ranges if math.isfinite(r))
@@ -125,7 +161,23 @@ class LidarNode(NodeBase):
             scans=self._scan_count,
             fov_deg=self.fov.fov_deg,
             blind_deg=self.fov.blind_deg,
+            # Surfaced so a thin picture is explainable at a glance as the
+            # filter working, rather than looking like a LiDAR fault - the same
+            # reasoning as the camera's adaptive-bitrate rung in CLAUDE.md 6.
+            filtered_out=self.filter.rejected,
         )
+
+    def _filtered(self, scan: LaserScan) -> LaserScan:
+        """Apply the persistence gate, preserving the rest of the scan contract."""
+        if not self.filter.enabled:
+            return scan
+        ranges = self.filter.apply(list(scan.ranges))
+        intensities = list(scan.intensities) if scan.intensities else None
+        if intensities is not None:
+            for i, rng in enumerate(ranges):
+                if not math.isfinite(rng):
+                    intensities[i] = 0.0
+        return replace(scan, ranges=ranges, intensities=intensities or [])
 
     @staticmethod
     def _to_cloud(scan: LaserScan) -> PointCloud:

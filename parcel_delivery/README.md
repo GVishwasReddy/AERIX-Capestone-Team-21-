@@ -122,6 +122,34 @@ Set them in Mission Planner / QGroundControl or via MAVProxy `param set`. Verify
 with `PRX_` status in the proximity view — if the Pi is streaming correctly you
 will see returns on the radar display.
 
+### Field of view — the rear wedge is masked
+
+The C1 spins a full circle, but only **250 deg of it is streamed** to the flight
+controller: 125 deg left + 125 deg right of the nose. The remaining 110 deg
+directly behind is reported as `65535` (unknown) in every revolution.
+
+That rear wedge is the aircraft's own tail and legs, plus whatever it is
+standing next to. Those returns never move, so streaming them makes ArduPilot
+brake for obstacles that are effectively bolted to the vehicle — which is what
+a rooftop takeoff looks like to an unmasked scan.
+
+```
+LIDAR_FOV_ENABLED=true
+LIDAR_FOV_DEG=250          # must match lidar.fov_deg in drone_stack/config/real.yaml
+```
+
+Two things this does **not** do, both worth knowing before you trust it:
+
+- **Unknown is not "blocked".** ArduPilot's proximity database reads an unknown
+  sector as *clear*, so BendyRuler will still happily route into ground the
+  sensor has never scanned. Not turning your back on unscanned ground is a
+  separate mechanism: `WP_YAW_BEHAVIOR = 1` plus drone_stack's yaw gate. See
+  `docs/31aug_status.md` § 7.
+- **It is not a reverse escape.** With the rear unmeasured there is no safe way
+  out backwards; front and both sides blocked means brake and hold.
+
+Set `LIDAR_FOV_ENABLED=false` only to bench-test a lidar off the airframe.
+
 ### Lidar driver notes (RPLIDAR C1)
 
 The C1 is driven over **raw serial** by `lidar_bridge.RPLidarC1`, not through the
@@ -197,10 +225,10 @@ pip install pytest
 python -m pytest tests/ -q
 ```
 
-64 tests covering coordinate/geofence/altitude validation, every state-machine
-transition and failure path, the C1 measurement-node parser, and the
-`OBSTACLE_DISTANCE` message construction (with synthetic scans — no lidar
-needed).
+100 tests covering coordinate/geofence/altitude validation, every state-machine
+transition and failure path, the C1 measurement-node parser, the
+`OBSTACLE_DISTANCE` message construction and the field-of-view mask (with
+synthetic scans — no lidar needed).
 
 ## Known limitations
 

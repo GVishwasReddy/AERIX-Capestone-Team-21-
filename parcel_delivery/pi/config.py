@@ -35,6 +35,11 @@ class Config:
     # Lidar
     lidar_port: str
     lidar_baud: int
+    # Scanned window, centred on the nose. Mirrors lidar.fov_deg in
+    # drone_stack's config/*.yaml — keep the two in step or the GCS radar and
+    # this bridge disagree about what the aircraft can see.
+    lidar_fov_enabled: bool
+    lidar_fov_deg: float
 
     # Firebase
     firebase_credentials_path: str
@@ -50,6 +55,19 @@ def load_config(env_path: str | None = None) -> Config:
 
     def _f(name: str, default: float) -> float:
         return float(os.environ.get(name, default))
+
+    def _b(name: str, default: bool) -> bool:
+        # Fail loud on a typo rather than silently disabling a safety mask:
+        # bool("false") is True, which is exactly the trap here.
+        raw = os.environ.get(name)
+        if raw is None or raw == "":
+            return default
+        lowered = raw.strip().lower()
+        if lowered in ("1", "true", "yes", "on"):
+            return True
+        if lowered in ("0", "false", "no", "off"):
+            return False
+        raise RuntimeError(f"{name} must be a boolean, got {raw!r}")
 
     def _req(name: str) -> str:
         value = os.environ.get(name)
@@ -75,6 +93,8 @@ def load_config(env_path: str | None = None) -> Config:
         ),
         lidar_port=os.environ.get("LIDAR_PORT", "/dev/ttyUSB0"),
         lidar_baud=int(os.environ.get("LIDAR_BAUD", "460800")),
+        lidar_fov_enabled=_b("LIDAR_FOV_ENABLED", True),
+        lidar_fov_deg=_f("LIDAR_FOV_DEG", 250.0),
         firebase_credentials_path=_req("FIREBASE_CREDENTIALS_PATH"),
         firebase_db_url=_req("FIREBASE_DB_URL"),
         log_dir=os.environ.get("LOG_DIR", "logs"),

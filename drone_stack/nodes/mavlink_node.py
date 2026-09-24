@@ -67,7 +67,7 @@ class MavlinkNode(NodeBase):
         # default LOW -> Lock. Edge-triggered so it never fights the GCS buttons
         # unless the switch actually moves. Lock/Release must match app.js.
         pl = config.section("payload")
-        self._payload_out_ch = int(pl.get("out_channel", 9))   # FC output (AUX1)
+        self._payload_out_ch = int(pl.get("out_channel", 12))  # FC output (AUX4)
         self._payload_rc_ch = int(pl.get("rc_channel", 9))     # transmitter input
         self._payload_lock_us = int(pl.get("lock_us", 1100))
         self._payload_release_us = int(pl.get("release_us", 1410))

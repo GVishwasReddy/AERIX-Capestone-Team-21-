@@ -477,7 +477,7 @@ class DeliveryNode(NodeBase):
         payload = self.config.section("payload")
         self._send_mavlink(
             "set_servo",
-            channel=int(payload.get("out_channel", 9)),
+            channel=int(payload.get("out_channel", 12)),
             pwm=int(payload.get("release_us", 1410)),
         )
 

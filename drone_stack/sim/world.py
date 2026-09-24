@@ -52,6 +52,26 @@ class SimObstacle:
     vy: float = 0.0
 
 
+def flip_yaw_frame(rad: float) -> float:
+    """Convert between this simulator's MATH yaw and the stack's COMPASS yaw.
+
+    Its own inverse, so one function serves both directions.
+
+    SimWorld thinks in the maths convention - angle measured anticlockwise
+    from EAST - because its motion model, ``raycast`` and ``mock_lidar`` are
+    all written that way and stay consistent with each other. Everything
+    outside the simulator thinks in the compass convention - clockwise from
+    NORTH - because that is what ``body_to_enu``/``enu_to_body`` implement and
+    what a real autopilot's ATTITUDE message carries.
+
+    compass = 90 deg - maths, which is a reflection, not a rotation: applying
+    it twice returns the original. That is why it is safe to use in both
+    directions and why getting it wrong is not a constant offset you would
+    notice as "a bit off" - it mirrors left and right.
+    """
+    return wrap_pi(math.pi / 2.0 - rad)
+
+
 @dataclass
 class VehicleState:
     x: float = 0.0
@@ -60,7 +80,9 @@ class VehicleState:
     vx: float = 0.0          # ENU east velocity
     vy: float = 0.0          # ENU north velocity
     vz: float = 0.0          # up velocity
-    yaw: float = 0.0         # rad
+    # rad, MATHS convention: anticlockwise from EAST, NOT a compass heading.
+    # Converted to compass exactly once, in get_messages. See flip_yaw_frame.
+    yaw: float = 0.0
     roll: float = 0.0
     pitch: float = 0.0
     armed: bool = False
@@ -82,7 +104,14 @@ class SimWorld:
         self._climb_rate = 1.5
         self._max_accel = 4.0
 
-        self.state = VehicleState(yaw=math.radians(float(sim.get("start_heading_deg", 0.0))))
+        # start_heading_deg is a COMPASS heading - 0 = north - because that is
+        # what an operator means by a heading. VehicleState.yaw is internal
+        # maths-frame, so it is converted on the way in.
+        self.state = VehicleState(
+            yaw=flip_yaw_frame(
+                math.radians(float(sim.get("start_heading_deg", 0.0)))
+            )
+        )
         self._battery_v = float(sim.get("battery_capacity_v", 16.8))
         self._battery_full = self._battery_v
         self._battery_empty = 13.2
@@ -183,8 +212,10 @@ class SimWorld:
                 )
                 self._cmd_vel_expiry = time.monotonic() + 0.5
             elif name == "yaw":
-                # direction +1 = right/CW; our ENU yaw is CCW-positive, so a
-                # right turn decreases yaw.
+                # MAV_CMD_CONDITION_YAW: direction +1 = right/clockwise. The
+                # internal angle is maths-frame (anticlockwise from east), so a
+                # clockwise turn DECREASES it - which is what makes the
+                # published compass heading, flip_yaw_frame(s.yaw), increase.
                 direction = 1 if int(p.get("direction", 1)) >= 0 else -1
                 delta = math.radians(abs(float(p.get("angle", 0.0)))) * direction
                 s.yaw = wrap_pi(s.yaw - delta)
@@ -302,7 +333,24 @@ class SimWorld:
             if s.armed:
                 base_mode |= 128  # MAV_MODE_FLAG_SAFETY_ARMED
             ground_speed = math.hypot(s.vx, s.vy)
-            heading = (math.degrees(s.yaw)) % 360.0
+            # THE boundary between the simulator's maths frame and the stack's
+            # compass frame. Converted here, once, and nowhere else.
+            #
+            # Until 2026-09-19 the internal angle was published raw. Measured
+            # that day: a simulated aircraft flying due north reported
+            # Attitude.yaw = 90 deg and course_deg = 90 deg. FusionNode feeds
+            # Attitude.yaw straight into fused.yaw, which every bearing in the
+            # stack then rotates by - the yaw gate, the pre-RTL turn, the
+            # about-face, obstacle body-frame bearings, the GCS heading arrow.
+            # All of them were mirrored about the 45 deg line in simulation.
+            #
+            # None of it showed up in the suite because the simulator is
+            # internally consistent: raycast and mock_lidar share the maths
+            # frame, so sim obstacles landed where sim yaw said they would.
+            # It is the same shape as the POSHOLD hover in CLAUDE.md 11 - a
+            # simulator that agrees with itself and not with the aircraft.
+            yaw_compass = flip_yaw_frame(s.yaw)
+            heading = math.degrees(yaw_compass) % 360.0
             return [
                 Heartbeat(base_mode=base_mode, system_status=4 if s.armed else 3),
                 ArmedStatus(armed=s.armed),
@@ -321,7 +369,7 @@ class SimWorld:
                 Attitude(
                     roll=s.roll,
                     pitch=s.pitch,
-                    yaw=wrap_pi(s.yaw),
+                    yaw=yaw_compass,
                 ),
                 Imu(
                     ax=math.sin(s.pitch) * -_GRAVITY,
@@ -330,8 +378,10 @@ class SimWorld:
                     gx=0.0,
                     gy=0.0,
                     gz=0.0,
-                    mx=math.cos(s.yaw),
-                    my=math.sin(s.yaw),
+                    # Body-frame field toward magnetic north, for a compass
+                    # heading: +x forward, +y left.
+                    mx=math.cos(yaw_compass),
+                    my=-math.sin(yaw_compass),
                     mz=0.0,
                 ),
                 Battery(
