@@ -20,6 +20,7 @@ on-board AI, releases the parcel only after a BLE + vision handshake, and flies 
 
 [Features](#-features) ·
 [Architecture](#-system-architecture) ·
+[Protocols](#-communication-protocols) ·
 [Repository map](#-repository-map) ·
 [Quick start](#-quick-start) ·
 [Configuration](#-configuration) ·
@@ -156,6 +157,118 @@ stateDiagram-v2
         (stick-driven altitude caused 2 crashes).
     end note
 ```
+
+---
+
+## 📡 Communication protocols
+
+Every link in the system uses a standard transport. The one protocol designed for this project
+is the **BLE delivery handshake** between the customer's phone and the drone.
+
+| Link | Transport | Protocol | Code |
+|---|---|---|---|
+| Pi ⇄ Pixhawk | USB serial | MAVLink (ArduPilot common set, no custom dialect) | `interfaces/mavlink_interface.py` |
+| Pi ← RPLIDAR C1 | USB serial, 460800 baud | Slamtec scan protocol, with a quality byte and persistence filter | `interfaces/lidar_interface.py` |
+| Phone ⇄ Drone | Bluetooth LE GATT | **Custom AERIX handshake** (below) | `ble_handshake/drone_ble_peripheral.py` |
+| Phone → Firestore ← Pi | HTTPS | Firestore orders; the drone writes separate `drone*` fields with `merge=True` | `interfaces/firebase_interface.py` |
+| BLE peripheral → GCS | HTTP on localhost | `POST /api/command`, `GET /api/state` | `gcs/server.py` · `gcs/hub.py` |
+| GCS ⇄ Browser | WebSocket `/ws` + MJPEG over HTTP | JSON state at 15 Hz with a credit window; adaptive-quality video | `gcs/ws_flow.py` · `gcs/cameras.py` |
+| Node ⇄ Node | In-process | `MessageBus` pub/sub; state topics are latched, command topics never are | `bus/message_bus.py` |
+
+### BLE delivery handshake
+
+The drone advertises one GATT service with five characteristics. Every signature is
+HMAC-SHA256, keyed with a **one-time `deliveryToken` for each order**, which the phone and the
+drone both fetch from Firestore before takeoff.
+
+| # | Characteristic | Access | Payload |
+|:-:|---|:-:|---|
+| 1 | `NONCE` `…5679` | read | 16 random bytes. Every read issues a new nonce and resets the session. |
+| 2 | `AUTH` `…567a` | write | `HMAC(token, nonce)[:20]`, which proves the phone holds the token |
+| 2 | `AUTH` `…567a` | read | `HMAC(token, nonce + "ACK")[:20]`, which proves the drone holds it too (mutual authentication) |
+| 3 | `GPS` `…567c` | write | `"lat,lng"` (8 decimal places) + `0x00` + `HMAC(token, nonce + gps)[:16]` |
+| 4 | `DROP` `…567b` | write | `HMAC(token, nonce + gps + "DROP")[:20]` |
+| 5 | `RESULT` `…567d` | read | `OK` · `PENDING` · `NOT_READY` · `AUTH_FAIL` · `GEOFENCE_FAIL` · `SIGNATURE_FAIL` |
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant FS as ☁️ Firestore
+    participant App as 📱 Customer app
+    participant BLE as 🛩️ BLE peripheral (Pi)
+    participant GCS as 🖥️ GCS + NavigationNode
+
+    Note over FS,BLE: Before takeoff both sides fetch the same one-time deliveryToken
+    FS-->>App: order + deliveryToken
+    FS-->>BLE: firebase_sync pull-order (token, target)
+
+    App->>BLE: read NONCE
+    BLE-->>App: 16 random bytes
+    App->>BLE: write AUTH = HMAC(token, nonce)
+    Note right of BLE: verified, so the drone starts sampling the phone's RSSI
+    App->>BLE: read AUTH
+    BLE-->>App: ACK = HMAC(token, nonce + "ACK")
+    Note left of App: app checks the ACK, so the drone is genuine
+
+    loop until 5 consistent fixes within 12 s (no jump over 20 m)
+        App->>BLE: write GPS = lat,lng + signature
+        BLE->>GCS: POST ble_phone_fix (helps find the recipient)
+    end
+    BLE->>GCS: GET /api/state (drone live GPS)
+    opt phone more than 10 m from the drone
+        BLE->>GCS: POST goto_gps (follow-me)
+        BLE-->>App: RESULT = GEOFENCE_FAIL, app retries
+    end
+
+    App->>BLE: write DROP = HMAC(token, nonce + gps + "DROP")
+    BLE->>GCS: GET /api/state (mission.handshake_open?)
+    alt camera has not locked onto a person yet
+        BLE-->>App: RESULT = NOT_READY (token not spent, retry)
+    else all gates pass
+        BLE->>GCS: POST ble_delivery_result
+        BLE->>GCS: POST set_servo, AUX4 release, 2 s, lock
+        Note right of BLE: signed receipt written, token expired
+        App->>BLE: read RESULT
+        BLE-->>App: OK
+    end
+    Note over FS,BLE: After landing, firebase_sync push-receipts uploads the drone's receipt
+```
+
+**The DROP gates, checked in order.** The first failure is what `RESULT` reports:
+
+1. **Authenticated:** the `AUTH` HMAC matched the current nonce.
+2. **Geofence:** 5 GPS fixes that agree with each other, and the phone within 10 m of the drone's own GPS.
+3. **Signature:** the `DROP` HMAC binds the nonce and the verified GPS, so a DROP can't be replayed or moved to another position.
+4. **Person locked:** the navigator opens the release window only when the camera has locked onto a person at the drop point. If the GCS doesn't answer, the release stays closed.
+
+Other properties of the protocol:
+- **The drone decides when the drop happened.** A successful write of `DROP` doesn't mean the parcel
+  released. Only `RESULT = OK` does.
+- **Each order's token works once.** After a drop, the token is spent and the drone writes a signed
+  receipt. The drone's receipt and the phone's are uploaded separately, so there are two records.
+- **Follows the current order.** The peripheral polls the GCS and reloads the token whenever a new order is being flown.
+- **Fits the rest of the stack.** The peripheral never drives hardware directly. The servo channel and
+  pulse widths come from `config/default.yaml` through the GCS.
+
+> [!NOTE]
+> **Hardening to do before a public demo:**
+> - Replace the placeholder service UUID (`12345678-1234-5678-1234-567812345678`) with a randomly
+>   generated one, in both the Pi code and the Flutter app.
+> - Set `AERIX_BLE_STRICT=1` on the aircraft. This disables the `--dev` bench fallback, which
+>   uses a token that is published in this repo.
+
+### Other link-level rules
+
+- **WebSocket flow control:** the browser acknowledges each telemetry frame after it has drawn it,
+  and the server keeps at most 2 frames unacknowledged. Each frame also leaves out whatever that
+  connection already has, so a slow tab gets fewer, always-fresh frames instead of a growing backlog.
+- **Adaptive video:** the MJPEG stream steps down through 1.0 / 0.75 / 0.5 scale settings to suit the
+  slowest viewer, and waits 25 s before trying a sharper one. The server socket sets
+  `TCP_NOTSENT_LOWAT` so stale video can't queue up in the send buffer.
+- **Command topics are never replayed:** `/cmd/mavlink`, `/mission/cmd` and the BLE events are
+  event topics. A restarted node can't re-run an old `arm` or `takeoff`.
+- **LiDAR goes to the autopilot too:** `ProximityNode` streams filtered 5° sectors as MAVLink
+  `OBSTACLE_DISTANCE`, so ArduPilot's own avoidance still works while the pilot flies by hand.
 
 ---
 
