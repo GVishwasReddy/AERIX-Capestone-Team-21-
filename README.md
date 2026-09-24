@@ -39,8 +39,9 @@ on-board AI, releases the parcel only after a BLE + vision handshake, and flies 
 | 🧭 | **Autonomy** | Waypoint missions, a mission state machine, a hard **3 m altitude ceiling**, a home position latched once on the ground, SMART_RTL with a fallback to RTL, and pilot-override arbitration. |
 | 🚧 | **Obstacle avoidance** | RPLIDAR C1 scans → obstacle extraction and tracking → VFH / sector / long-range avoidance on the Pi, plus `OBSTACLE_DISTANCE` streamed to the flight controller so avoidance still works when the pilot flies by hand. |
 | 📦 | **Firebase delivery** | Orders from the Flutter app (Firestore) become flown missions: climb → cruise → GUIDED hover → release → SMART_RTL → land. An operator must press **ACCEPT** before it flies. |
-| 🤖 | **On-board AI (Hailo-8)** | Terrain segmentation and person detection on the NPU, a flicker-free single-target person lock, digital stabilisation, and camera-driven landing-zone scoring. |
-| 🔐 | **Recipient handshake** | A BLE peripheral with an HMAC-signed one-time token. The payload servo (AUX1) is released only when the BLE and vision checks both agree. |
+| 🤖 | **On-board AI (Hailo-8)** | Aerial person detection on the NPU (a YOLO model trained on VisDrone), a flicker-free single-target person lock, digital stabilisation, and terrain-segmentation landing-zone scoring in the optional novelty layer. |
+| 🎯 | **Camera-tilt servo** | An MG90S on AUX6 aims the Pi camera. It tilts **down** 3 m before the drop point so the operator sees the recipient from overhead, and back **up** for the flight home. |
+| 🔐 | **Recipient handshake** | A BLE peripheral with an HMAC-signed one-time token. The MG995 payload servo (AUX4) releases only after the handshake passes. |
 | 🎥 | **Flight recorder** | Starts recording when the drone arms and keeps one clip per flight. A post-flight replay renderer adds zero-phase stabilisation and a lock HUD, encoded to H.264. |
 | 🧪 | **Simulation first** | Mock Pixhawk, LiDAR and world. The whole stack, including deliveries, runs with no hardware attached. |
 
@@ -85,9 +86,10 @@ flowchart TB
 
     subgraph HW["🔌 Hardware"]
         direction LR
-        PX["Pixhawk 2.4.8<br/>ArduPilot"] -->|"AUX1 PWM"| SERVO["MG995R<br/>payload servo"]
+        PX["Pixhawk 2.4.8<br/>ArduPilot"] -->|"AUX4"| SERVO["MG995<br/>payload release"]
+        PX -->|"AUX6"| TILT["MG90S<br/>camera tilt"]
         LI["RPLIDAR C1"]
-        CAM["Pi Cam v3 · USB cam"]
+        CAM["Pi Cam v3<br/>imx708"]
         NPU["Hailo-8 NPU"]
     end
 
@@ -100,7 +102,7 @@ flowchart TB
     classDef st fill:#ede9fe,stroke:#7c3aed,color:#4c1d95
     classDef gc fill:#dbeafe,stroke:#2563eb,color:#1e3a8a
     classDef ex fill:#ecfdf5,stroke:#059669,color:#064e3b
-    class PX,SERVO,LI,CAM,NPU hw
+    class PX,SERVO,TILT,LI,CAM,NPU hw
     class MAV,LID,FUS,OBS,PROX,NAV,DEL,NOV st
     class CAMS,HUB,UI gc
     class APP,FB,BLE ex
@@ -144,6 +146,10 @@ stateDiagram-v2
     Release --> RTL: payload dropped
     RTL --> Landed: SMART_RTL (falls back to RTL)
     Landed --> [*]: disarm
+    note left of Cruise
+        Camera tilts DOWN 3 m before the drop point,
+        back UP when the aircraft turns for home.
+    end note
     note right of Hover
         Hover is always GUIDED.
         POSHOLD / LOITER are rejected in code
@@ -282,9 +288,10 @@ scripts/start_gcs.sh real                      # → http://pi.local:8090
 |---|---|---|
 | Pixhawk 2.4.8 (ArduPilot) | `/dev/ttyACM0` | USB |
 | Slamtec RPLIDAR C1 | `/dev/ttyUSB0` | 460800 baud |
-| Pi Cam v3 (imx708) + Logitech C270 | CSI / USB | MJPEG tiles over the map |
+| Raspberry Pi Camera v3 (imx708) | CSI | the only camera; MJPEG stream over the map, mounted upside down (rotated by the ISP) |
 | Hailo-8 AI HAT+ | PCIe | the camera overlays fall back to plain video if missing |
-| MG995R payload servo | Pixhawk **AUX1** (SERVO9) | separate supply, common GND |
+| MG995 payload-release servo | Pixhawk **AUX4** (SERVO12) | separate supply, common GND · config block `payload:` |
+| MG90S camera-tilt servo | Pixhawk **AUX6** (SERVO14) | separate 5 V supply, common GND · config block `aux2_servo:` |
 
 On the Pi the GCS starts on boot as `aerix-gcs.service` (real mode, port 8090). **Only one
 process may hold the Pixhawk port**, so stop the service before running `start_gcs.sh` or any
@@ -371,7 +378,6 @@ need hardware.
 | [docs/30auglidarintegration.md](docs/30auglidarintegration.md) · [docs/31aug_status.md](docs/31aug_status.md) | LiDAR integration log and project status |
 | [parcel_delivery/README.md](parcel_delivery/README.md) | Standalone MAVSDK delivery prototype |
 | [person_detect/README.md](person_detect/README.md) | Hailo-8 person detector |
-| [CLAUDE.md](CLAUDE.md) | Detailed engineering notebook and changelog |
 
 ---
 

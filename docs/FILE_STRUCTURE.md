@@ -85,10 +85,11 @@ shared `MessageBus`. Nodes never call each other directly. Everything goes throu
 flowchart TB
     subgraph ext["Outside world"]
         PX["Pixhawk"]
+        SRV["Servos<br/>AUX4 payload · AUX6 camera tilt"]
         LD["RPLIDAR"]
         FS[("Firestore")]
         PH["Phone (BLE)"]
-        CM["Cameras + Hailo-8"]
+        CM["Pi Cam v3 + Hailo-8"]
     end
 
     subgraph ifc["interfaces/ · sim/"]
@@ -119,6 +120,7 @@ flowchart TB
     BLEP["ble_handshake/<br/>drone_ble_peripheral.py"]
 
     PX <--> MI <--> MN
+    PX -->|"DO_SET_SERVO"| SRV
     LD --> LI --> LN
     FS --> FI --> DN
     CM --> CA
@@ -155,7 +157,6 @@ so a node that restarts can't replay an old `arm` or `takeoff`.
 | File | Purpose |
 |---|---|
 | `README.md` | Project overview |
-| `CLAUDE.md` | Detailed engineering notebook: hardware, incidents, changelog |
 | `pyproject.toml` · `setup.py` · `setup.cfg` | Packaging; installs the `drone-stack` and `drone-gcs` console scripts |
 | `requirements*.txt` | Core, hardware-only and dev dependencies |
 | `firebase_sync.py` | Firestore store-and-forward utility (top-level copy) |
@@ -164,7 +165,7 @@ so a node that restarts can't replay an old `arm` or `takeoff`.
 
 | File | Purpose |
 |---|---|
-| `default.yaml` | Every tunable with its default value (`mode: sim`) |
+| `default.yaml` | Every tunable with its default value (`mode: sim`), including the `payload:` (AUX4) and `aux2_servo:` (AUX6 camera tilt) servo blocks |
 | `sim.yaml` | Simulation profile: file order source, auto-accept |
 | `real.yaml` | Hardware profile: serial ports, battery thresholds, port 8090 |
 | `novelty/landing_zone.yaml` | Surface, slope and clutter thresholds for markerless landing |
@@ -222,8 +223,8 @@ so a node that restarts can't replay an old `arm` or `takeoff`.
 | `server.py` | FastAPI and WebSocket server |
 | `hub.py` | `GcsHub`: owns the engine, builds the 15 Hz payload, dispatches UI commands |
 | `ws_flow.py` | Flow control for each WebSocket connection |
-| `cameras.py` | Camera capture, NPU overlays, MJPEG streaming |
-| `hailo_infer.py` | Hailo-8 segmentation and detection runners |
+| `cameras.py` | Pi camera capture (the only camera), NPU overlays, MJPEG streaming |
+| `hailo_infer.py` | Hailo-8 detection and segmentation runners (used by the novelty perception adapters) |
 | `frame_filter.py` | Real-time image conditioning |
 | `stabilizer.py` | Live digital stabilisation for the Pi camera |
 | `person_lock.py` | Single-target person lock (async NPU detector + Kalman filter) |
